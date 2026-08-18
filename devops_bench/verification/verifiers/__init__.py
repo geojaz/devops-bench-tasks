@@ -20,6 +20,8 @@ from devops_bench.verification.verifiers.cloud_resource_property import (
 from devops_bench.verification.verifiers.external_http_probe import ExternalHttpProbeVerifier
 from devops_bench.verification.verifiers.git_repo_sync import GitRepoSyncVerifier
 from devops_bench.verification.verifiers.http_probe import HttpProbeVerifier
+from devops_bench.verification.verifiers.identity_preserved import IdentityPreservedVerifier
+from devops_bench.verification.verifiers.pod_exec import PodExecVerifier
 from devops_bench.verification.verifiers.pod_healthy import PodHealthyVerifier
 from devops_bench.verification.verifiers.resource_property import (
     ResourcePropertyVerifier,
@@ -35,6 +37,8 @@ __all__ = [
     "ExternalHttpProbeVerifier",
     "GitRepoSyncVerifier",
     "HttpProbeVerifier",
+    "IdentityPreservedVerifier",
+    "PodExecVerifier",
     "PodHealthyVerifier",
     "ResourcePropertyVerifier",
     "ScalingCompleteVerifier",
