@@ -332,65 +332,6 @@ def exec_pod(
     return _run_kubectl(argv, kubeconfig, timeout=timeout)
 
 
-def apply(
-    path: str,
-    *,
-    namespace: str | None = None,
-    kubeconfig: KubeconfigSource = None,
-    context: str | None = None,
-) -> CompletedProcess:
-    """Apply a manifest file or directory via ``kubectl apply -f``.
-
-    Args:
-        path: Manifest file, directory, or URL passed to ``-f``.
-        namespace: Optional namespace (``-n``).
-        kubeconfig: Kubeconfig path or context-like object.
-        context: Optional kubeconfig context to pin the call to.
-
-    Returns:
-        The completed process.
-
-    Raises:
-        SubprocessError: If kubectl exits non-zero or times out.
-    """
-    argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
-    return _run_kubectl(argv, kubeconfig, context=context)
-
-
-def rollout_status(
-    resource: str,
-    *,
-    timeout_sec: float | None = None,
-    namespace: str | None = None,
-    kubeconfig: KubeconfigSource = None,
-    context: str | None = None,
-) -> CompletedProcess:
-    """Wait for a rollout to finish via ``kubectl rollout status``.
-
-    Args:
-        resource: Resource reference, e.g. ``"deployment/web"``.
-        timeout_sec: Optional maximum seconds to wait (``--timeout=<n>s``).
-        namespace: Optional namespace (``-n``).
-        kubeconfig: Kubeconfig path or context-like object.
-        context: Optional kubeconfig context to pin the call to.
-
-    Returns:
-        The completed process.
-
-    Raises:
-        SubprocessError: If the rollout does not complete before the timeout.
-    """
-    argv = [
-        "kubectl",
-        "rollout",
-        "status",
-        resource,
-        *([f"--timeout={timeout_sec}s"] if timeout_sec is not None else []),
-        *_namespace_args(namespace),
-    ]
-    return _run_kubectl(argv, kubeconfig, context=context)
-
-
 def run_pod(
     name: str,
     image: str,
@@ -452,6 +393,65 @@ def run_pod(
         extra_kwargs["timeout"] = timeout
     completed = _run_kubectl(argv, kubeconfig, context=context, **extra_kwargs)
     return completed.stdout
+
+
+def apply(
+    path: str,
+    *,
+    namespace: str | None = None,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> CompletedProcess:
+    """Apply a manifest file or directory via ``kubectl apply -f``.
+
+    Args:
+        path: Manifest file, directory, or URL passed to ``-f``.
+        namespace: Optional namespace (``-n``).
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubeconfig context to pin the call to.
+
+    Returns:
+        The completed process.
+
+    Raises:
+        SubprocessError: If kubectl exits non-zero or times out.
+    """
+    argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
+    return _run_kubectl(argv, kubeconfig, context=context)
+
+
+def rollout_status(
+    resource: str,
+    *,
+    timeout_sec: float | None = None,
+    namespace: str | None = None,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> CompletedProcess:
+    """Wait for a rollout to finish via ``kubectl rollout status``.
+
+    Args:
+        resource: Resource reference, e.g. ``"deployment/web"``.
+        timeout_sec: Optional maximum seconds to wait (``--timeout=<n>s``).
+        namespace: Optional namespace (``-n``).
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubeconfig context to pin the call to.
+
+    Returns:
+        The completed process.
+
+    Raises:
+        SubprocessError: If the rollout does not complete before the timeout.
+    """
+    argv = [
+        "kubectl",
+        "rollout",
+        "status",
+        resource,
+        *([f"--timeout={timeout_sec}s"] if timeout_sec is not None else []),
+        *_namespace_args(namespace),
+    ]
+    return _run_kubectl(argv, kubeconfig, context=context)
 
 
 @contextlib.contextmanager

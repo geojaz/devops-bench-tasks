@@ -136,6 +136,18 @@ variable "pod_subnet" {
   default     = ""
 }
 
+variable "cni_manifest_url" {
+  type        = string
+  description = "Manifest URL applied when disable_default_cni is true (KinD-only)"
+  default     = "https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml"
+}
+
+variable "cni_wait_timeout" {
+  type        = string
+  description = "Timeout for the replacement CNI's rollout and node-Ready wait, when disable_default_cni is true (KinD-only)"
+  default     = "180s"
+}
+
 variable "host_kubecontext" {
   type        = string
   description = "Host Kubernetes context to use (vcluster-only)"

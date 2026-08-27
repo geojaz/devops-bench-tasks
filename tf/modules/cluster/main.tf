@@ -47,6 +47,8 @@ module "kind" {
   node_count          = var.node_count
   disable_default_cni = var.disable_default_cni
   pod_subnet          = var.pod_subnet
+  cni_manifest_url    = var.cni_manifest_url
+  cni_wait_timeout    = var.cni_wait_timeout
 }
 
 
