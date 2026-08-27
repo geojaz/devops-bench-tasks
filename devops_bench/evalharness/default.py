@@ -506,6 +506,7 @@ class DefaultEvalHarness(Harness):
         cluster_name: str,
         target_deployment: str | None = None,
         namespace: str | None = None,
+        extra: dict[str, str] | None = None,
     ) -> str:
         """Substitute infrastructure placeholders in a prompt or expectation.
 
@@ -519,19 +520,26 @@ class DefaultEvalHarness(Harness):
             cluster_name: Active cluster name to substitute.
             target_deployment: Optional target deployment name override.
             namespace: Optional namespace override.
+            extra: Additional ``{{NAME}}`` -> value pairs, e.g. a stack's own
+                tofu outputs (see :attr:`~devops_bench.core.ClusterInfo.outputs`),
+                keyed by the placeholder name (uppercase). Applied after the
+                fixed set below.
 
         Returns:
             The text with all known placeholders replaced.
         """
         target_dep = target_deployment or self.target_deployment
         ns = namespace or self.namespace
-        return (
+        resolved = (
             text.replace("{{PROJECT_ID}}", self.project_id)
             .replace("{{CLUSTER_NAME}}", cluster_name)
             .replace("{{APP_LOCATION}}", self.app_location)
             .replace("{{TARGET_DEPLOYMENT_NAME}}", target_dep)
             .replace("{{NAMESPACE}}", ns)
         )
+        for key, value in (extra or {}).items():
+            resolved = resolved.replace("{{" + key + "}}", value)
+        return resolved
 
     def _resolve_spec_placeholders(
         self,
@@ -539,6 +547,7 @@ class DefaultEvalHarness(Harness):
         cluster_name: str,
         target_deployment: str | None = None,
         namespace: str | None = None,
+        extra: dict[str, str] | None = None,
     ) -> Any:
         """Walk a nested spec and substitute placeholders in every string leaf.
 
@@ -558,23 +567,29 @@ class DefaultEvalHarness(Harness):
                 :meth:`replace_placeholders`.
             target_deployment: Optional target deployment name override.
             namespace: Optional namespace override.
+            extra: Additional placeholders, forwarded to
+                :meth:`replace_placeholders`.
 
         Returns:
             A new structure with placeholders resolved. ``None`` round-trips
             unchanged so a missing spec stays missing.
         """
         if isinstance(spec, str):
-            resolved = self.replace_placeholders(spec, cluster_name, target_deployment, namespace)
+            resolved = self.replace_placeholders(
+                spec, cluster_name, target_deployment, namespace, extra
+            )
             return _CLUSTER_NAME_ENV_RE.sub(cluster_name, resolved)
         if isinstance(spec, list):
             return [
-                self._resolve_spec_placeholders(item, cluster_name, target_deployment, namespace)
+                self._resolve_spec_placeholders(
+                    item, cluster_name, target_deployment, namespace, extra
+                )
                 for item in spec
             ]
         if isinstance(spec, dict):
             return {
                 key: self._resolve_spec_placeholders(
-                    value, cluster_name, target_deployment, namespace
+                    value, cluster_name, target_deployment, namespace, extra
                 )
                 for key, value in spec.items()
             }
@@ -588,6 +603,7 @@ class DefaultEvalHarness(Harness):
         cluster_name: str,
         target_deployment: str | None = None,
         namespace: str | None = None,
+        extra: dict[str, str] | None = None,
     ) -> list[ChaosSpec]:
         """Parse the raw task ``chaos_spec`` blob into typed :class:`ChaosSpec` list.
 
@@ -596,7 +612,9 @@ class DefaultEvalHarness(Harness):
         """
         if not raw:
             return []
-        resolved = self._resolve_spec_placeholders(raw, cluster_name, target_deployment, namespace)
+        resolved = self._resolve_spec_placeholders(
+            raw, cluster_name, target_deployment, namespace, extra
+        )
         # A placeholder-substituted JSON string round-trips through
         # ``json.loads`` to a list/dict the discriminated union can validate.
         if isinstance(resolved, str):
@@ -1165,22 +1183,30 @@ class DefaultEvalHarness(Harness):
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
+            # A stack's own tofu outputs beyond cluster_name/cluster_location
+            # (e.g. a global LB IP) become {{OUTPUT_NAME}} placeholders, uppercased
+            # to match the fixed set's convention.
+            extra_placeholders = {k.upper(): v for k, v in cluster_info.outputs.items()}
 
-            prompt = self.replace_placeholders(task.prompt, active_cluster_name, target_dep, ns)
+            prompt = self.replace_placeholders(
+                task.prompt, active_cluster_name, target_dep, ns, extra_placeholders
+            )
             # Resolved here, before the agent runs, so a failure mid-execution
             # still records the substituted checklists rather than raw
             # placeholders.
             recoverable_safety = [
-                self.replace_placeholders(item, active_cluster_name, target_dep, ns)
+                self.replace_placeholders(
+                    item, active_cluster_name, target_dep, ns, extra_placeholders
+                )
                 for item in task.recoverable_safety
             ]
 
             chaos_specs = self._parse_chaos_specs(
-                task.chaos_spec, active_cluster_name, target_dep, ns
+                task.chaos_spec, active_cluster_name, target_dep, ns, extra_placeholders
             )
             entries, verification_parse_errors = parse_entries(
                 self._resolve_spec_placeholders(
-                    task.verification_spec, active_cluster_name, target_dep, ns
+                    task.verification_spec, active_cluster_name, target_dep, ns, extra_placeholders
                 )
             )
             if verification_parse_errors:
@@ -1287,7 +1313,7 @@ class DefaultEvalHarness(Harness):
                 artifact_collection_failures = [{"name": "<unknown>", "error": str(exc)}]
 
             expected_output = self.replace_placeholders(
-                task.expected_output, active_cluster_name, target_dep, ns
+                task.expected_output, active_cluster_name, target_dep, ns, extra_placeholders
             )
 
             chaos_report, perf_report = self._drain_scenario(scenario_manager, scenario_thread)

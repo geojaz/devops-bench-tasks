@@ -7,13 +7,14 @@
 #
 #   docker build -f hack/agent-sandbox.Dockerfile -t devops-bench/agent-sandbox:dev .
 #
-# Pin GEMINI_CLI_VERSION for reproducible runs. Leaving it at "latest" means the
-# agent under test changes underneath you between runs, which quietly makes
-# results incomparable.
+# Pin GEMINI_CLI_VERSION / OPENCLAW_VERSION for reproducible runs. Leaving
+# either at "latest" means the agent under test changes underneath you between
+# runs, which quietly makes results incomparable.
 FROM node:22-slim
 
 ARG KUBECTL_VERSION=v1.31.4
 ARG GEMINI_CLI_VERSION=latest
+ARG OPENCLAW_VERSION=latest
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -28,8 +29,20 @@ RUN arch="$(dpkg --print-architecture)" \
  && chmod 0755 /usr/local/bin/kubectl \
  && kubectl version --client=true >/dev/null
 
-RUN npm install -g "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
+# Both agent CLIs the harness knows how to drive (devops_bench/agents/cli/):
+# gemini_cli's native `gemini` binary, and openclaw's `oc` (the multi-model
+# runner used for Claude/Vertex-backed agent-under-test runs). Installed
+# system-wide so openclaw/agent.py's nvm-sourcing line in its bash command is
+# a no-op here (Node/oc are already on PATH without it).
+RUN npm install -g "@google/gemini-cli@${GEMINI_CLI_VERSION}" "openclaw@${OPENCLAW_VERSION}" \
  && npm cache clean --force
+
+# openclaw's package.json registers its bin as `openclaw`, not `oc` -- the `oc`
+# name is a convention this harness's own operator tooling relies on (see
+# devops_bench/agents/cli/openclaw/agent.py's `_resolve_oc_bin`), not something
+# npm sets up. Without this symlink `oc` resolves to nothing inside the image.
+RUN ln -s "$(command -v openclaw)" /usr/local/bin/oc \
+ && oc --version
 
 # The wrapper runs this container as the host user's uid:gid so files written to
 # the mounted workspace are owned correctly. That uid does not exist in

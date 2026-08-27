@@ -422,8 +422,6 @@ def test_resolve_spec_placeholders_leaves_unrelated_bash_variables_untouched() -
     resolved = harness._resolve_spec_placeholders(raw, "kind", "web", "shop")
 
     assert resolved["value"] == "${FOO}-kind"
-
-
 # --- hold-mode entries report from the monitor's observations, never fresh --------
 
 
