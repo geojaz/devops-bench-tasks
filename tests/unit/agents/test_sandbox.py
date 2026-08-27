@@ -44,10 +44,25 @@ def test_sandbox_state_false_for_incapable_adapter_even_with_env_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Never report True for an adapter that cannot containerise, regardless
-    of what BENCH_AGENT_SANDBOX says: antigravity/openclaw/api never read it."""
+    of what BENCH_AGENT_SANDBOX says: antigravity/api never read it.
+
+    openclaw moved into SANDBOX_CAPABLE_AGENT_TYPES alongside gemini once its
+    own harness grew a ``BENCH_AGENT_SANDBOX=docker`` path (see
+    agents/cli/openclaw/agent.py); see the adjacent
+    ``test_sandbox_state_true_for_openclaw_when_capable_and_enabled`` test for
+    its own (now True) case."""
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
-    for agent_type in ("antigravity", "openclaw", "api"):
+    for agent_type in ("antigravity", "api"):
         assert sandbox.sandbox_state(agent_type) is False
+
+
+def test_sandbox_state_true_for_openclaw_when_capable_and_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """openclaw wraps its CLI in ``docker run`` the same way gemini does, so
+    it reads as sandboxed too once BENCH_AGENT_SANDBOX is set."""
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    assert sandbox.sandbox_state("openclaw") is True
 
 
 def test_sandbox_image_none_when_not_sandboxed(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -180,12 +180,13 @@ def sandbox_enabled() -> bool:
 
 
 # Canonical agent-registry keys whose harness actually knows how to wrap its
-# CLI in a container (see agents/cli/gemini_cli/agent.py, the only caller of
-# wrap_argv). ``antigravity``, ``openclaw`` and ``api`` invoke their agent
-# directly and never read BENCH_AGENT_SANDBOX at all, so for those adapters
-# "sandbox off" is not something the operator chose; the run was never a
-# candidate for containment in the first place.
-SANDBOX_CAPABLE_AGENT_TYPES = frozenset({"gemini"})
+# CLI in a container (see agents/cli/gemini_cli/agent.py and
+# agents/cli/openclaw/agent.py, the only two callers of wrap_argv).
+# ``antigravity`` and ``api`` invoke their agent directly and never read
+# BENCH_AGENT_SANDBOX at all, so for those adapters "sandbox off" is not
+# something the operator chose; the run was never a candidate for
+# containment in the first place.
+SANDBOX_CAPABLE_AGENT_TYPES = frozenset({"gemini", "openclaw"})
 
 
 def sandbox_state(agent_type: str) -> bool:

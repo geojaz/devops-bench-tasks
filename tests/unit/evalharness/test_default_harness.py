@@ -1566,11 +1566,39 @@ def test_write_run_artifacts_records_sandboxed_false_when_sandbox_off(
     assert rows[0]["sandboxed"] is False
 
 
+def test_write_run_artifacts_records_sandboxed_true_on_the_openclaw_path(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """openclaw wraps its CLI in ``docker run`` the same way gemini does (see
+    agents/cli/openclaw/agent.py), so it must read as sandboxed too, not just
+    the original gemini adapter."""
+    from devops_bench.evalharness.reporter import ResultReporter
+
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+
+    harness = DefaultEvalHarness(
+        project_id="p",
+        cluster_name="c",
+        reporter=ResultReporter(tmp_path),
+        agent_type="openclaw",
+    )
+    run_dir = harness.reporter.new_run_dir()
+    harness._write_run_artifacts(run_dir, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001
+
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    rows = json.loads((run_dir / "rows.json").read_text())
+    assert manifest["sandboxed"] is True
+    assert manifest["sandboxImage"] == "devops-bench/agent-sandbox:dev"
+    assert rows[0]["sandboxed"] is True
+
+
 def test_write_run_artifacts_records_sandboxed_false_for_a_non_containerising_adapter(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A non-gemini adapter never containerises, so it must never read as
-    sandboxed even when BENCH_AGENT_SANDBOX is (irrelevantly) set."""
+    """The api adapter invokes its agent directly and never reads
+    BENCH_AGENT_SANDBOX at all, so it must never read as sandboxed even when
+    BENCH_AGENT_SANDBOX is (irrelevantly) set."""
     from devops_bench.evalharness.reporter import ResultReporter
 
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
@@ -1579,7 +1607,7 @@ def test_write_run_artifacts_records_sandboxed_false_for_a_non_containerising_ad
         project_id="p",
         cluster_name="c",
         reporter=ResultReporter(tmp_path),
-        agent_type="openclaw",
+        agent_type="api",
     )
     run_dir = harness.reporter.new_run_dir()
     harness._write_run_artifacts(run_dir, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001

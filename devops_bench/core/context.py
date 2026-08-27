@@ -57,6 +57,11 @@ class ClusterInfo:
             several contexts, or none selected as current. ``None`` when the
             provider could not resolve one, in which case callers fall back
             to the ambient current-context.
+        outputs: Extra stack outputs beyond ``cluster_name``/``cluster_location``
+            (e.g. a global LB IP), keyed by their raw (lowercase) tofu output
+            name. Empty for deployers that don't surface any. Non-scalar and
+            ``sensitive`` outputs are dropped by the populating deployer, never
+            stored here.
     """
 
     name: str
@@ -64,6 +69,7 @@ class ClusterInfo:
     project: str | None = None
     kubeconfig_path: str = field(default_factory=_resolve_kubeconfig)
     context: str | None = None
+    outputs: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, info: dict[str, Any]) -> ClusterInfo:
