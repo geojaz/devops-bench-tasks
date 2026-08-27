@@ -51,6 +51,7 @@ from the granted bindings, so the agent structurally satisfies
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import json
 import os
@@ -61,6 +62,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from devops_bench.agents import sandbox
 from devops_bench.agents.base import AGENTS, AgentHarness
 from devops_bench.agents.cli.openclaw.parsing import (
     _pick_session_key,
@@ -124,7 +126,7 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
 # catalog; the harness registers these per-run (see :func:`_build_model_override`).
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
-_CATALOG_OVERRIDES: frozenset[str] = frozenset({"gemini-3.5-flash"})
+_CATALOG_OVERRIDES: frozenset[str] = frozenset({"gemini-3.5-flash", "gemini-3.7-flash"})
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
 # built-in provider rather than merging, so without ``api`` oc falls back to the
@@ -440,27 +442,145 @@ class OpenClawAgent(AgentHarness):
 
             command = _build_local_command(self.config, final_prompt, self.agent_name, oc_bin)
 
+            # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker. Only
+            # the agent turn itself moves into the container: state_dir/openclaw.json
+            # above are already written into workdir (mounted in as /workspace), and
+            # _extract_trajectory below reads that same state back on the host, so it
+            # needs no sandboxing of its own (it is a harness-side read of the turn's
+            # own output, not new untrusted execution).
+            sandboxed = False
+            container_name: str | None = None
+            run_argv: list[str] | None = None
+            if sandbox.sandbox_enabled():
+                cluster = sandbox.current_cluster_name()
+                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir) if cluster else None
+                if kubeconfig is None:
+                    # Refuse rather than silently running unsandboxed on the host: a
+                    # containment control that quietly degrades is worse than none.
+                    return AgentResult.errored(
+                        "BENCH_AGENT_SANDBOX is set but no sandbox kubeconfig could be "
+                        "built; refusing to fall back to an unsandboxed run"
+                    )
+                container_name = sandbox.container_name_for_workspace(workdir)
+                # A container never inherits the host shell's environment (unlike
+                # the non-sandboxed branch below, which merges env_overlay into
+                # os.environ) -- only what wrap_argv bakes in as -e flags exists
+                # inside it. _build_env only carries the routed API key / explicit
+                # config.extra_env, not the Vertex transport vars a keyless
+                # google-vertex run still needs (GOOGLE_CLOUD_PROJECT and friends),
+                # which the non-sandboxed path got for free via inheritance. Pass
+                # those through from the ambient env explicitly; env_overlay's own
+                # keys still win on overlap (there shouldn't be any).
+                vertex_passthrough = {
+                    var: os.environ[var]
+                    for var in (
+                        "GOOGLE_CLOUD_PROJECT",
+                        "GOOGLE_CLOUD_LOCATION",
+                        "GOOGLE_GENAI_USE_VERTEXAI",
+                        "GCP_PROJECT_ID",
+                        "GCP_VERTEX_LOCATION",
+                    )
+                    if var in os.environ
+                }
+                # A keyless google-vertex run (config.api_key unset, the
+                # GOOGLE_CLOUD_API_KEY=gcp-vertex-credentials ADC marker) resolves
+                # credentials from a real ADC file on disk (authorized_user /
+                # external_account / service_account -- see openclaw's own
+                # vertex-adc module), not from the metadata server the sandbox
+                # deliberately has no route to and not from a bare bearer token in
+                # an env var. The host's own ADC file is outside the mounted
+                # workspace by construction, so copy it in and point the container
+                # at the copy; the generic workdir->/workspace rewrite below then
+                # rewrites this path the same as any other.
+                adc_host_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+                if adc_host_path and Path(adc_host_path).is_file():
+                    adc_copy = workdir / "adc.json"
+                    adc_copy.write_bytes(Path(adc_host_path).read_bytes())
+                    adc_copy.chmod(0o600)
+                    vertex_passthrough["GOOGLE_APPLICATION_CREDENTIALS"] = str(adc_copy)
+                # OPENCLAW_STATE_DIR/OPENCLAW_CONFIG_PATH above are host-absolute
+                # paths under workdir (e.g. /tmp/oc-run-xxx/state), but wrap_argv
+                # mounts workdir at /workspace inside the container -- passed
+                # through unchanged, oc would look for its config/state at a path
+                # that doesn't exist there, silently fall back to its built-in
+                # catalog, and fail to resolve a model registered only in the
+                # per-run override (as `gemini-3.7-flash` did here). Rewrite every
+                # value that is actually a subpath of workdir to its /workspace
+                # equivalent; anything else (API keys, model ids) passes through as-is.
+                container_env_overlay = {
+                    key: (f"/workspace{value[len(str(workdir)):]}" if value.startswith(str(workdir)) else value)
+                    for key, value in {**vertex_passthrough, **env_overlay}.items()
+                }
+                # bash -c is still needed inside the container: the image installs
+                # Node/oc system-wide, so the nvm-sourcing line in `command` is a
+                # harmless no-op there, and command's shlex-quoting is unaffected by
+                # the shell that runs it.
+                run_argv = sandbox.wrap_argv(
+                    ["/bin/bash", "-c", command],
+                    workspace=workdir,
+                    kubeconfig=kubeconfig,
+                    extra_env=container_env_overlay,
+                    container_name=container_name,
+                )
+                sandboxed = True
+
             # TODO(follow-up): on TimeoutExpired this SIGKILLs only the bash
             # child, orphaning the oc/gcloud/kubectl/MCP process tree (which keeps
             # consuming Vertex quota). Run in its own process group
             # (start_new_session=True) and os.killpg(...) on timeout. Tracked as a
             # separate, more intrusive change to generalize across all CLI agents.
+            guard = (
+                sandbox.container_guard(container_name)
+                if container_name is not None
+                else contextlib.nullcontext()
+            )
             try:
-                completed = subprocess.run(
-                    command,
-                    shell=True,  # noqa: S602 - bash needed for nvm; all values shlex.quoted
-                    executable="/bin/bash",
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=self.config.timeout_sec,
-                    cwd=str(workdir),
-                    env={**os.environ, **env_overlay},
-                )
+                with guard:
+                    if sandboxed:
+                        # docker run's own argv is not a shell command; env crosses
+                        # the boundary as explicit -e flags baked into run_argv, not
+                        # via the local process's inherited environment.
+                        completed = subprocess.run(
+                            run_argv,
+                            shell=False,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=self.config.timeout_sec,
+                            cwd=str(workdir),
+                            env=os.environ,
+                        )
+                    else:
+                        completed = subprocess.run(
+                            command,
+                            shell=True,  # noqa: S602 - bash needed for nvm; all values shlex.quoted
+                            executable="/bin/bash",
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=self.config.timeout_sec,
+                            cwd=str(workdir),
+                            env={**os.environ, **env_overlay},
+                        )
             except subprocess.TimeoutExpired as exc:
                 return AgentResult.errored(f"oc agent timed out after {exc.timeout}s")
             except OSError as exc:
                 return AgentResult.errored(f"oc binary unavailable: {exc}")
+
+            if sandboxed:
+                # oc persists sessions.json / *.trajectory-path.json with the
+                # /workspace-relative paths it saw from inside the container
+                # (sessionFile/runtimeFile fields). _extract_trajectory below runs
+                # on the HOST against this same directory (state_dir is workdir's
+                # own subpath, unaffected by the container boundary -- only the
+                # env values passed *into* the container needed rewriting above),
+                # so a stored "/workspace/..." path resolves to nothing there and
+                # oc fails with "Session file not found". Rewrite it back before
+                # the host-side lookup runs.
+                for state_file in state_dir.rglob("*.json"):
+                    text = state_file.read_text()
+                    if "/workspace" in text:
+                        state_file.write_text(text.replace("/workspace", str(workdir)))
 
             stdout_text = _strip_ansi(completed.stdout or "")
             errors: list[str] = []

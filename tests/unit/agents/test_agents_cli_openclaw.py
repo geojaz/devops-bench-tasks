@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from devops_bench.agents import AGENTS, AgentConfig
+from devops_bench.agents import AGENTS, AgentConfig, sandbox
 from devops_bench.agents.capabilities import (
     AgentRules,
     AllCapabilities,
@@ -356,6 +356,164 @@ def test_execute_happy_path_emits_canonical_trajectory(monkeypatch, tmp_path):
     assert result.trajectory[0]["name"] == "kubectl_get_pods"
     assert result.tokens == {"input": 5, "output": 10, "total": 15}
     assert result.output == "All pods healthy."
+
+
+def test_execute_sandboxed_wraps_argv_in_docker_run(monkeypatch, tmp_path):
+    """BENCH_AGENT_SANDBOX=docker routes the agent turn through sandbox.wrap_argv
+    as a real argv list (not shell=True), and never falls back to the host when
+    a sandbox kubeconfig can't be built.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "some-vertex-project")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
+    monkeypatch.setattr(
+        sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
+    )
+    (tmp_path / "kubeconfig").write_text("apiVersion: v1\n")
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        # container_guard's cleanup also calls through subprocess.run (docker
+        # kill, via core.subprocess.run) on the way out -- only capture the
+        # agent turn itself (the "docker run" invocation), not that cleanup call.
+        if isinstance(argv, list) and argv[:2] == ["docker", "run"]:
+            captured["argv"] = argv
+            captured["shell"] = kwargs.get("shell")
+        return _make_subprocess_result(stdout="OK\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    assert captured["shell"] is False
+    assert captured["argv"][:2] == ["docker", "run"]
+    assert "devops-bench/agent-sandbox:dev" in captured["argv"]
+    assert ["/bin/bash", "-c"] == captured["argv"][-3:-1]
+
+    # OPENCLAW_STATE_DIR (and OPENCLAW_CONFIG_PATH, when present) must be
+    # rewritten to their /workspace equivalents -- passed through as the host's
+    # own tmp_path, oc inside the container can't find its state/config, falls
+    # back to its built-in model catalog, and any per-run catalog override
+    # (e.g. a model unknown to that catalog) fails with "Unknown model: ...".
+    env_flags = {
+        captured["argv"][i + 1].split("=", 1)[0]: captured["argv"][i + 1].split("=", 1)[1]
+        for i, arg in enumerate(captured["argv"])
+        if arg == "-e"
+    }
+    assert env_flags["OPENCLAW_STATE_DIR"] == "/workspace/state"
+    assert str(tmp_path) not in env_flags["OPENCLAW_STATE_DIR"]
+
+    # A container never inherits the host shell's environment the way the
+    # non-sandboxed branch does via os.environ merge -- the Vertex transport
+    # vars a keyless google-vertex run needs must be explicitly passed through,
+    # or oc fails inside the container with "Vertex AI requires a project ID."
+    assert env_flags["GOOGLE_CLOUD_PROJECT"] == "some-vertex-project"
+    assert env_flags["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+
+
+def test_execute_sandboxed_copies_adc_file_into_workspace(monkeypatch, tmp_path):
+    """A keyless google-vertex run needs a real ADC file on disk inside the
+    container (openclaw's vertex-adc module only accepts authorized_user /
+    external_account / service_account credentials, never a bare bearer token
+    or the metadata server the sandbox has no route to). The host's ADC file
+    sits outside the mounted workspace, so it must be copied in and the env
+    var rewritten to point at the copy's /workspace path.
+    """
+    adc_source = tmp_path.parent / "host-adc.json"
+    adc_source.write_text('{"type": "authorized_user"}')
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc_source))
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
+    monkeypatch.setattr(
+        sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
+    )
+    (tmp_path / "kubeconfig").write_text("apiVersion: v1\n")
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        if isinstance(argv, list) and argv[:2] == ["docker", "run"]:
+            captured["argv"] = argv
+        return _make_subprocess_result(stdout="OK\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    env_flags = {
+        captured["argv"][i + 1].split("=", 1)[0]: captured["argv"][i + 1].split("=", 1)[1]
+        for i, arg in enumerate(captured["argv"])
+        if arg == "-e"
+    }
+    assert env_flags["GOOGLE_APPLICATION_CREDENTIALS"] == "/workspace/adc.json"
+    assert (tmp_path / "adc.json").read_text() == '{"type": "authorized_user"}'
+
+
+def test_execute_sandboxed_rewrites_workspace_paths_in_session_state(monkeypatch, tmp_path):
+    """oc persists sessions.json / *.trajectory-path.json with the
+    /workspace-relative paths it saw from inside the container. The host-side
+    _extract_trajectory call runs against the real host directory, so a stored
+    "/workspace/..." path must be rewritten back to workdir's real path -- left
+    unrewritten, oc fails with "Session file not found for agent:main:main."
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
+    monkeypatch.setattr(
+        sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
+    )
+    (tmp_path / "kubeconfig").write_text("apiVersion: v1\n")
+
+    def fake_run(argv, **kwargs):
+        if isinstance(argv, list) and argv[:2] == ["docker", "run"]:
+            # Simulate what the container itself would have written: session
+            # state referencing its own /workspace view of the mounted dir.
+            sessions_dir = tmp_path / "state" / "agents" / "main" / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            (sessions_dir / "sessions.json").write_text(
+                '{"agent:main:main": {"sessionFile": "/workspace/state/agents/main/'
+                'sessions/abc.jsonl"}}'
+            )
+        return _make_subprocess_result(stdout="OK\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    rewritten = (tmp_path / "state" / "agents" / "main" / "sessions" / "sessions.json").read_text()
+    assert "/workspace" not in rewritten
+    assert str(tmp_path) in rewritten
+
+
+def test_execute_sandboxed_refuses_without_kubeconfig(monkeypatch, tmp_path):
+    """A containment control that quietly degrades is worse than none: no
+    sandbox kubeconfig must error out, never fall back to an unsandboxed run.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: None)
+
+    def fail_run(cmd, **kwargs):
+        raise AssertionError("must not run anything when the sandbox kubeconfig is missing")
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+    assert result.has_errors()
+    assert "BENCH_AGENT_SANDBOX" in result.errors[0]
 
 
 def test_execute_prefers_bundle_output_over_noisy_stdout(monkeypatch, tmp_path):
