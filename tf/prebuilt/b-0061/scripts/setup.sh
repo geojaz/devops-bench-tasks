@@ -63,7 +63,7 @@ fi
 MANIFESTS_DIR="${MANIFESTS_DIR:?MANIFESTS_DIR is required}"
 MANIFESTS_DIR="$(cd "${MANIFESTS_DIR}" && pwd)"
 WORLD_JSON="${WORLD_JSON:?WORLD_JSON is required}"
-WAIT_TIMEOUT="${WAIT_TIMEOUT:-180}"
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-420}"
 
 # Fault target: notifications-sync-web (the web-chain frontend Deployment in
 # notifications-sync), and the actor that reverts it: billing-sync-worker

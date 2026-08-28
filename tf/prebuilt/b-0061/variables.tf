@@ -42,7 +42,7 @@ variable "kubeconfig_path" {
 variable "wait_timeout" {
   type        = string
   description = "Seconds each bounded poll in setup.sh will wait before declaring SEED FAIL."
-  default     = "180"
+  default     = "420"
 }
 
 # Unused by this bare stack, but declared so tasks that pin NAMESPACE (for
