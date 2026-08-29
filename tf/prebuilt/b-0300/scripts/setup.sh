@@ -26,12 +26,18 @@ WAIT_TIMEOUT="${WAIT_TIMEOUT:-180}"
 if [[ "${INFRA_PROVIDER}" == "vcluster" ]]; then
   echo "==> Waiting for the vcluster API endpoint..."
   _deadline=$((SECONDS+WAIT_TIMEOUT))
-  until kubectl get --raw=/readyz >/dev/null 2>&1; do
+  _stable_ready_samples=0
+  while (( _stable_ready_samples < 5 )); do
+    if kubectl --request-timeout=10s get --raw=/readyz >/dev/null 2>&1; then
+      _stable_ready_samples=$((_stable_ready_samples+1))
+    else
+      _stable_ready_samples=0
+    fi
     if (( SECONDS >= _deadline )); then
-      echo "SETUP FAIL: vcluster API endpoint did not become ready within ${WAIT_TIMEOUT}s" >&2
+      echo "SETUP FAIL: vcluster API endpoint did not remain ready within ${WAIT_TIMEOUT}s" >&2
       exit 1
     fi
-    sleep 3
+    if (( _stable_ready_samples < 5 )); then sleep 3; fi
   done
 fi
 
