@@ -257,7 +257,7 @@ class GeminiCliAgent(AgentHarness):
             container_name: str | None = None
             if sandbox.sandbox_enabled():
                 cluster = sandbox.current_cluster_name()
-                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir) if cluster else None
+                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir)
                 if kubeconfig is None:
                     # Refuse rather than silently running unsandboxed on the host: a
                     # containment control that quietly degrades is worse than none.
@@ -272,6 +272,7 @@ class GeminiCliAgent(AgentHarness):
                     kubeconfig=kubeconfig,
                     extra_env=env_overlay,
                     container_name=container_name,
+                    network="kind" if cluster else None,
                 )
                 sandboxed = True
 

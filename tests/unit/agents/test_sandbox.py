@@ -36,6 +36,73 @@ def test_container_name_for_workspace_differs_per_workspace() -> None:
     assert a != b
 
 
+def test_current_cluster_name_returns_none_for_non_kind_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout="gke_simrankaurk-gke-dev_us-central1-a_optscale-eval\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    assert sandbox.current_cluster_name() is None
+
+
+def test_current_cluster_name_strips_kind_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sandbox,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout="kind-my-cluster\n", stderr=""),
+    )
+    assert sandbox.current_cluster_name() == "my-cluster"
+
+
+def test_uses_exec_credential_plugin_true_when_exec_block_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sandbox,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(
+            returncode=0, stdout="map[apiVersion:client.authentication.k8s.io/v1beta1 ...]", stderr=""
+        ),
+    )
+    assert sandbox.uses_exec_credential_plugin() is True
+
+
+def test_uses_exec_credential_plugin_false_when_no_exec_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sandbox, "run", lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr="")
+    )
+    assert sandbox.uses_exec_credential_plugin() is False
+
+
+def test_wrap_argv_defaults_to_kind_network() -> None:
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+    )
+    assert "--network" in argv
+    assert argv[argv.index("--network") + 1] == "kind"
+
+
+def test_wrap_argv_omits_network_flag_when_network_is_none() -> None:
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+        network=None,
+    )
+    assert "--network" not in argv
+
+
 def test_wrap_argv_includes_name_flag_when_container_name_given() -> None:
     argv = sandbox.wrap_argv(
         ["gemini", "-p", "hi"],
@@ -158,6 +225,78 @@ def test_sweep_stray_containers_handles_docker_ps_failure_without_raising(
 
     monkeypatch.setattr(sandbox, "run", fake_run)
     sandbox.sweep_stray_containers()  # must not raise
+
+
+def _exec_plugin_dispatch(
+    *, sa_exists: bool, sa_token: str | None = "sa-token", admin_token: str | None = None
+):
+    """A fake ``run`` dispatching on argv shape, for exec-plugin build_agent_kubeconfig tests."""
+
+    def fake_run(argv, **kwargs):
+        if argv[-1] == "jsonpath={.clusters[0].cluster.certificate-authority-data}":
+            return SimpleNamespace(returncode=0, stdout="ZmFrZS1jYQ==", stderr="")
+        if argv[-1] == "jsonpath={.users[0].user.exec}":
+            return SimpleNamespace(returncode=0, stdout="map[command:some-cloud-auth-plugin]", stderr="")
+        if argv[-1] == "jsonpath={.clusters[0].cluster.server}":
+            return SimpleNamespace(returncode=0, stdout="https://34.1.2.3", stderr="")
+        if argv[:5] == ["kubectl", "-n", sandbox.AGENT_SA_NAMESPACE, "get", "sa"]:
+            return SimpleNamespace(returncode=0 if sa_exists else 1, stdout="", stderr="")
+        if argv[:5] == ["kubectl", "-n", sandbox.AGENT_SA_NAMESPACE, "create", "token"]:
+            return SimpleNamespace(returncode=0, stdout=sa_token or "", stderr="")
+        if argv == ["some-cloud", "print-access-token"]:
+            return SimpleNamespace(returncode=0, stdout=admin_token or "", stderr="")
+        raise AssertionError(f"unexpected argv in exec-plugin kubeconfig test: {argv}")
+
+    return fake_run
+
+
+def test_build_agent_kubeconfig_exec_plugin_with_seeded_service_account_uses_its_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        sandbox, "run", _exec_plugin_dispatch(sa_exists=True, sa_token="scoped-token\n")
+    )
+    path = sandbox.build_agent_kubeconfig(None, tmp_path)
+    assert path is not None
+    text = path.read_text()
+    assert "https://34.1.2.3" in text
+    assert "token: scoped-token" in text
+
+
+def test_build_agent_kubeconfig_exec_plugin_without_service_account_mints_admin_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(sandbox.ADMIN_TOKEN_CMD_ENV, "some-cloud print-access-token")
+    monkeypatch.setattr(
+        sandbox, "run", _exec_plugin_dispatch(sa_exists=False, admin_token="ya29.admin-token\n")
+    )
+    path = sandbox.build_agent_kubeconfig(None, tmp_path)
+    assert path is not None
+    text = path.read_text()
+    assert "https://34.1.2.3" in text
+    assert "token: ya29.admin-token" in text
+
+
+def test_build_agent_kubeconfig_exec_plugin_refuses_without_service_account_or_admin_token_cmd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(sandbox.ADMIN_TOKEN_CMD_ENV, raising=False)
+    monkeypatch.setattr(sandbox, "run", _exec_plugin_dispatch(sa_exists=False))
+    assert sandbox.build_agent_kubeconfig(None, tmp_path) is None
+
+
+def test_build_agent_kubeconfig_refuses_when_context_is_neither_kind_nor_exec_plugin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_run(argv, **kwargs):
+        if argv[-1] == "jsonpath={.clusters[0].cluster.certificate-authority-data}":
+            return SimpleNamespace(returncode=0, stdout="ZmFrZS1jYQ==", stderr="")
+        if argv[-1] == "jsonpath={.users[0].user.exec}":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    assert sandbox.build_agent_kubeconfig(None, tmp_path) is None
 
 
 def test_sweep_stray_containers_is_a_noop_when_none_are_running(

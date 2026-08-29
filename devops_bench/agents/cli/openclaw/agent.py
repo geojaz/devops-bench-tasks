@@ -33,7 +33,10 @@ a per-run temp dir:
   ``google-vertex`` (Vertex AI).
 * **Model auth** — ``config.api_key`` is threaded into the provider env var
   (``GEMINI_API_KEY``/``GOOGLE_CLOUD_API_KEY``/``ANTHROPIC_API_KEY``/...) that
-  ``oc agent --local`` reads.
+  ``oc agent --local`` reads. A keyless ``anthropic-vertex`` run additionally
+  needs an explicit per-agent auth-profile entry registered via
+  ``oc models auth paste-api-key`` before the turn runs — see
+  :func:`_needs_anthropic_vertex_auth_profile`.
 
 Trajectory extraction uses the official session commands documented in
 ``docs/openclaw/sessions.md``: run ``oc agent --local``, locate the single
@@ -125,13 +128,31 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
 # catalog; the harness registers these per-run (see :func:`_build_model_override`).
+# claude-fable-5 relies on anthropic-vertex-provider's own dynamic catalog
+# discovery instead when left out of this set (confirmed live: the plugin's
+# generated catalog.json correctly resolves it with real pricing/context-window
+# metadata) -- but an explicit override here is still the more robust path since
+# it does not depend on that discovery step succeeding. claude-opus-5 is not in
+# that dynamic catalog at all on anthropic-vertex-provider 2026.9.1-beta.1
+# (confirmed live: absent from both the generated catalog.json and `oc models
+# list`), so for this one the explicit override is not just more robust, it is
+# the only path that works.
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
-_CATALOG_OVERRIDES: frozenset[str] = frozenset({"gemini-3.5-flash", "gemini-3.7-flash"})
+_CATALOG_OVERRIDES: frozenset[str] = frozenset(
+    {"gemini-3.5-flash", "gemini-3.7-flash", "claude-fable-5", "claude-opus-5"}
+)
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
 # built-in provider rather than merging, so without ``api`` oc falls back to the
 # OpenAI transport and 401s. ``google`` needs no ``baseUrl``; for ``google-vertex``
-# ``{location}`` is expanded by oc, so it stays literal here.
+# ``{location}`` is expanded by oc, so it stays literal here. ``anthropic-vertex``
+# additionally pins ``apiKey`` to the literal ADC marker
+# (``gcp-vertex-credentials``) directly in the written config, matching exactly
+# what anthropic-vertex-provider's own dynamic catalog entry sets (confirmed by
+# inspecting a real generated catalog.json) -- google-vertex needs no such
+# marker in the config itself because oc's Gemini transport falls back to ADC
+# whenever no key-shaped value is present at all, a fallback anthropic-vertex's
+# transport does not share.
 _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
     "google": {
         "api": "google-generative-ai",
@@ -139,6 +160,11 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
     "google-vertex": {
         "api": "google-vertex",
         "baseUrl": "https://{location}-aiplatform.googleapis.com",
+    },
+    "anthropic-vertex": {
+        "api": "anthropic-messages",
+        "baseUrl": "https://aiplatform.googleapis.com",
+        "apiKey": "gcp-vertex-credentials",
     },
 }
 
@@ -319,6 +345,34 @@ def _oc_model_flag(config: AgentConfig) -> str:
     return f"--model {shlex.quote(model_id)} "
 
 
+def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
+    """Return whether this run must register a headless anthropic-vertex auth profile.
+
+    Confirmed live against openclaw 2026.9.1-beta.1 + anthropic-vertex-provider
+    2026.9.1-beta.1 (the first pairing where the plugin is correctly discovered
+    as a stock plugin -- see the Dockerfile comment): even with valid ADC
+    credentials on disk and the ``gcp-vertex-credentials`` marker pinned on
+    ``models.providers.anthropic-vertex.apiKey`` (see :data:`_PROVIDER_TRANSPORT`),
+    a bare run still aborts with ``ProviderAuthError: No API key found for
+    provider "anthropic-vertex"``. This version introduced a per-agent SQLite
+    auth-profile store that gates model auth *before* the plugin's own
+    ADC-detecting ``resolveSyntheticAuth`` hook is consulted, so the marker in
+    config is no longer sufficient on its own -- an explicit profile entry must
+    exist in that store too.
+
+    ``oc models auth paste-api-key --provider anthropic-vertex`` registers
+    that entry non-interactively (it reads the key from stdin, no TTY
+    required), so it is safe to run unattended before every keyless
+    anthropic-vertex turn (see :func:`_build_local_command`). It is a no-op
+    correctness-wise for a run that already carries an explicit API key.
+    """
+    try:
+        provider = resolve_provider(config.provider).oc_provider
+    except ConfigError:
+        return False
+    return provider == "anthropic-vertex" and not config.api_key
+
+
 def _prepend_rules(rules_text: str, prompt: str) -> str:
     """Return ``prompt`` with ``rules_text`` prepended as an operator brief.
 
@@ -358,10 +412,18 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
         A single bash command string ready for ``subprocess.run(shell=True)``.
     """
     quoted_oc = shlex.quote(oc_bin)
+    auth_setup = ""
+    if _needs_anthropic_vertex_auth_profile(config):
+        marker = _PROVIDER_TRANSPORT["anthropic-vertex"]["apiKey"]
+        auth_setup = (
+            f"printf '%s\\n' {shlex.quote(marker)} | {quoted_oc} models auth paste-api-key "
+            f"--provider anthropic-vertex --agent {shlex.quote(agent_name)}; "
+        )
     return (
         # Source nvm so the Node-based oc binary's runtime is available.
         'export NVM_DIR="$HOME/.nvm"; '
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
+        f"{auth_setup}"
         f"{quoted_oc} --log-level debug agent --local "
         f"--agent {shlex.quote(agent_name)} {_oc_model_flag(config)}-m {shlex.quote(prompt)}"
     )
@@ -453,7 +515,7 @@ class OpenClawAgent(AgentHarness):
             run_argv: list[str] | None = None
             if sandbox.sandbox_enabled():
                 cluster = sandbox.current_cluster_name()
-                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir) if cluster else None
+                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir)
                 if kubeconfig is None:
                     # Refuse rather than silently running unsandboxed on the host: a
                     # containment control that quietly degrades is worse than none.
@@ -479,6 +541,19 @@ class OpenClawAgent(AgentHarness):
                         "GOOGLE_GENAI_USE_VERTEXAI",
                         "GCP_PROJECT_ID",
                         "GCP_VERTEX_LOCATION",
+                        # The ADC marker itself (see the module docstring). For
+                        # google-vertex this is optional -- oc falls back to ADC
+                        # when no key-shaped env var is set at all. Confirmed live
+                        # that anthropic-vertex does NOT share that fallback: a
+                        # sandboxed run with GOOGLE_APPLICATION_CREDENTIALS pointing
+                        # at a valid, independently-verified-working ADC file still
+                        # failed with "Failed to acquire Google OAuth credentials"
+                        # until this marker was present, because anthropic-vertex's
+                        # own api_key_envs is empty (keyless by contract -- see
+                        # model_providers.py), so nothing in _build_env's
+                        # config.api_key routing can ever set it; only an ambient
+                        # env var passed through here can.
+                        "GOOGLE_CLOUD_API_KEY",
                     )
                     if var in os.environ
                 }
@@ -508,7 +583,11 @@ class OpenClawAgent(AgentHarness):
                 # value that is actually a subpath of workdir to its /workspace
                 # equivalent; anything else (API keys, model ids) passes through as-is.
                 container_env_overlay = {
-                    key: (f"/workspace{value[len(str(workdir)):]}" if value.startswith(str(workdir)) else value)
+                    key: (
+                        f"/workspace{value[len(str(workdir)) :]}"
+                        if value.startswith(str(workdir))
+                        else value
+                    )
                     for key, value in {**vertex_passthrough, **env_overlay}.items()
                 }
                 # bash -c is still needed inside the container: the image installs
@@ -521,6 +600,7 @@ class OpenClawAgent(AgentHarness):
                     kubeconfig=kubeconfig,
                     extra_env=container_env_overlay,
                     container_name=container_name,
+                    network="kind" if cluster else None,
                 )
                 sandboxed = True
 

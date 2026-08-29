@@ -42,6 +42,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import tempfile
 from collections.abc import Iterator
@@ -52,6 +53,8 @@ from devops_bench.core.subprocess import run
 
 __all__ = [
     "sandbox_enabled",
+    "current_cluster_name",
+    "uses_exec_credential_plugin",
     "build_agent_kubeconfig",
     "wrap_argv",
     "container_name_for_workspace",
@@ -95,15 +98,36 @@ def current_cluster_name() -> str | None:
     so rather than widen that interface we recover it from the context kind wrote:
     ``kind-<cluster>``. That is also exactly the prefix of the control-plane
     container name the container needs to reach, so the two stay consistent by
-    construction. Returns None for a non-kind context, which is the signal that
-    this sandbox's networking assumptions do not apply.
+    construction. Returns None for a non-kind context (not an error on its own:
+    see :func:`uses_exec_credential_plugin` for the other shape this sandbox
+    understands).
     """
     ctx = run(["kubectl", "config", "current-context"], check=False).stdout or ""
     ctx = ctx.strip()
     if not ctx.startswith("kind-"):
-        _log.error("context %r is not a kind context; the docker-network sandbox assumes kind", ctx)
         return None
     return ctx[len("kind-") :]
+
+
+def uses_exec_credential_plugin() -> bool:
+    """True when the active context authenticates via an exec credential plugin.
+
+    Deliberately provider-agnostic: this asks a structural question about the
+    current kubeconfig (does its ``user`` entry shell out to a plugin, e.g. a
+    cloud vendor's own ``kubectl`` credential helper, rather than carry a static
+    client certificate?), not "which cloud is this." Any such plugin is
+    unusable inside the sandboxed container (it is not installed there, and
+    would need ambient cloud credentials the container deliberately lacks), so
+    :func:`build_agent_kubeconfig` cannot reuse the operator's own user block
+    the way it does for a static client cert and must mint a bearer token
+    instead (see its non-kind branch). Which command mints that token is not
+    this module's concern either — see ``BENCH_SANDBOX_ADMIN_TOKEN_CMD`` there.
+    """
+    result = run(
+        ["kubectl", "config", "view", "--raw", "--minify", "-o", "jsonpath={.users[0].user.exec}"],
+        check=False,
+    )
+    return bool((result.stdout or "").strip())
 
 
 def _kubectl_json(*args: str) -> dict:
@@ -116,7 +140,17 @@ def _kubectl_json(*args: str) -> dict:
         return {}
 
 
-def build_agent_kubeconfig(cluster_name: str, dest_dir: Path) -> Path | None:
+# A caller outside this package sets this (see e.g. the GCP provider's
+# `ensure_cluster_credentials`) to whatever shell command mints a fresh bearer
+# token for the current cloud identity, when the current context authenticates
+# via an exec credential plugin this sandbox cannot run itself (see
+# :func:`uses_exec_credential_plugin`) and the task seeded no agent
+# ServiceAccount to fall back to. Kept as an env-sourced command rather than a
+# literal here so this module never has to name a specific cloud vendor.
+ADMIN_TOKEN_CMD_ENV = "BENCH_SANDBOX_ADMIN_TOKEN_CMD"
+
+
+def build_agent_kubeconfig(cluster_name: str | None, dest_dir: Path) -> Path | None:
     """Write a kubeconfig the container can use, and return its path.
 
     Two things have to change from the operator's own kubeconfig:
@@ -126,13 +160,30 @@ def build_agent_kubeconfig(cluster_name: str, dest_dir: Path) -> Path | None:
        ``kind``, so a container joined to it reaches the API server at
        ``https://<cluster>-control-plane:6443``. The API server certificate
        covers the control-plane node name, so TLS still verifies and no
-       ``--insecure-skip-tls-verify`` is needed.
-    2. The CREDENTIAL. The operator's context authenticates with an admin client
-       certificate. If the task seeded an agent ServiceAccount we mint a short
-       lived token for it instead, so the agent holds exactly the permissions the
-       task chose to give it. If it did not, we fall back to the admin
-       credential and say so loudly, because that is a strictly larger grant than
-       most tasks intend.
+       ``--insecure-skip-tls-verify`` is needed. A cloud-managed cluster's own
+       server URL (a real, publicly routable IP or DNS name) already means
+       something from inside a container, so it is reused as-is instead.
+    2. The CREDENTIAL. The operator's context authenticates as cluster-admin —
+       kind via a client certificate, a cloud-managed cluster typically via an
+       exec credential plugin (which needs an ambient cloud CLI/credential
+       install the sandbox deliberately lacks, so the container can't run it
+       itself). If the task seeded an agent ServiceAccount we mint a
+       short-lived token for it instead, so the agent holds exactly the
+       permissions the task chose to give it — this part is identical
+       regardless of cluster kind. If it did not, we fall back to an
+       admin-equivalent credential and say so loudly, because that is a
+       strictly larger grant than most tasks intend: kind's own client cert, or
+       for an exec-plugin context a bearer token minted by whatever command
+       :data:`ADMIN_TOKEN_CMD_ENV` names (set by the provider that knows how,
+       e.g. the same cloud identity Terraform's own ``kubernetes`` provider
+       already used to manage the cluster, so it is already proven to hold
+       real access — not a new grant).
+
+    Args:
+        cluster_name: The kind cluster name (see :func:`current_cluster_name`),
+            or ``None`` for a non-kind context — an exec-credential-plugin
+            context (:func:`uses_exec_credential_plugin`) is the only other
+            shape this understands.
 
     Returns None when no kubeconfig could be built, in which case the caller
     should refuse to run rather than silently fall back to the host.
@@ -153,7 +204,34 @@ def build_agent_kubeconfig(cluster_name: str, dest_dir: Path) -> Path | None:
         _log.error("could not read cluster CA from the current context; refusing to sandbox")
         return None
 
-    server = f"https://{cluster_name}-control-plane:6443"
+    exec_plugin_context = cluster_name is None and uses_exec_credential_plugin()
+    if cluster_name is not None:
+        server = f"https://{cluster_name}-control-plane:6443"
+    elif exec_plugin_context:
+        server = (
+            run(
+                [
+                    "kubectl",
+                    "config",
+                    "view",
+                    "--raw",
+                    "--minify",
+                    "-o",
+                    "jsonpath={.clusters[0].cluster.server}",
+                ],
+                check=False,
+            ).stdout
+            or ""
+        ).strip()
+        if not server:
+            _log.error("could not read the cluster's server URL from the current context")
+            return None
+    else:
+        _log.error(
+            "current context is neither kind nor an exec-credential-plugin context; "
+            "this sandbox's networking assumptions do not apply"
+        )
+        return None
 
     sa_exists = (
         run(
@@ -189,7 +267,7 @@ def build_agent_kubeconfig(cluster_name: str, dest_dir: Path) -> Path | None:
             AGENT_SA_NAMESPACE,
             AGENT_SA_NAME,
         )
-    else:
+    elif cluster_name is not None:
         # No task-declared identity. Reuse the operator's client cert. This is
         # cluster-admin on kind, so the container boundary is doing all the work
         # and the RBAC boundary is doing none.
@@ -227,6 +305,28 @@ def build_agent_kubeconfig(cluster_name: str, dest_dir: Path) -> Path | None:
             AGENT_SA_NAMESPACE,
             AGENT_SA_NAME,
         )
+    else:
+        # An exec-plugin context has no client cert in a modern kubeconfig (the
+        # exec plugin is the only user entry); mint a bearer token via whatever
+        # command the provider layer configured instead.
+        admin_token_cmd = os.environ.get(ADMIN_TOKEN_CMD_ENV, "").strip()
+        token = (
+            run(shlex.split(admin_token_cmd), check=False).stdout if admin_token_cmd else None
+        ) or ""
+        token = token.strip()
+        if not token:
+            _log.error(
+                "no agent ServiceAccount and no %s configured to mint a fallback token",
+                ADMIN_TOKEN_CMD_ENV,
+            )
+            return None
+        user_block = f"user: {{token: {token}}}"
+        _log.warning(
+            "no ServiceAccount %s/%s: agent runs with the operator's identity via a minted "
+            "access token. Seed one in the task's stack to scope it.",
+            AGENT_SA_NAMESPACE,
+            AGENT_SA_NAME,
+        )
 
     path = dest_dir / "kubeconfig"
     path.write_text(
@@ -249,6 +349,7 @@ def wrap_argv(
     image: str | None = None,
     extra_env: dict[str, str] | None = None,
     container_name: str | None = None,
+    network: str | None = "kind",
 ) -> list[str]:
     """Wrap an agent command line in ``docker run``.
 
@@ -271,6 +372,12 @@ def wrap_argv(
             :func:`container_guard` / :func:`sweep_stray_containers`) even
             after the local ``docker run`` client process is gone. Normally
             :func:`container_name_for_workspace` derived from ``workspace``.
+        network: Docker network to join. Defaults to ``"kind"`` (kind's own
+            network, needed to reach ``<cluster>-control-plane`` by name — see
+            :func:`build_agent_kubeconfig`). Pass ``None`` for a GKE-backed
+            kubeconfig: GKE's server is a real, publicly routable address that
+            already means something on the default bridge network, and there
+            is no ``kind`` network to join outside a kind-provisioned host.
     """
     image = image or os.environ.get("BENCH_AGENT_IMAGE", "")
     if not image:
@@ -286,6 +393,7 @@ def wrap_argv(
         env_flags += ["-e", f"{key}={value}"]
 
     name_flags = ["--name", container_name] if container_name else []
+    network_flags = ["--network", network] if network else []
 
     return [
         # No -i. Keeping stdin open gives the agent an open, non-TTY stdin to block
@@ -295,8 +403,7 @@ def wrap_argv(
         "run",
         "--rm",
         *name_flags,
-        "--network",
-        "kind",
+        *network_flags,
         "--user",
         f"{os.getuid()}:{os.getgid()}",
         "-v",

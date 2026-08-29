@@ -504,9 +504,14 @@ def test_execute_sandboxed_refuses_without_kubeconfig(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
     monkeypatch.setattr(sandbox, "current_cluster_name", lambda: None)
+    # build_agent_kubeconfig now probes the current context itself (kind vs. an
+    # exec-credential-plugin context vs. neither) rather than being skipped
+    # outright whenever current_cluster_name() is None, so it is mocked
+    # directly here to simulate the real "no kubeconfig could be built" outcome.
+    monkeypatch.setattr(sandbox, "build_agent_kubeconfig", lambda cluster, workdir: None)
 
     def fail_run(cmd, **kwargs):
-        raise AssertionError("must not run anything when the sandbox kubeconfig is missing")
+        raise AssertionError("must not run the agent itself when the sandbox kubeconfig is missing")
 
     monkeypatch.setattr(subprocess, "run", fail_run)
 
