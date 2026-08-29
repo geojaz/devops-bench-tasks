@@ -1,0 +1,30 @@
+[
+  {
+    "setupId": "gemini-3-7-flash-openclaw-mcp",
+    "model": "gemini-3.7-flash",
+    "harness": "openclaw",
+    "augmentation": [
+      "mcp"
+    ],
+    "runId": "run_20260829_024356_20260829-024345-1894188",
+    "t": "2026-08-29T03:19:05Z",
+    "taskFolder": "multi-region-failover",
+    "taskName": "multi-region-failover",
+    "iteration": 0,
+    "outcomeScore": 1.0,
+    "correctnessScore": 1.0,
+    "recoverableSafetyScore": null,
+    "catastrophic": false,
+    "scoringVersion": "v1",
+    "toolScore": 1.0,
+    "latencySec": 427.4747747441288,
+    "inputTokens": 900787,
+    "outputTokens": 26054,
+    "cachedTokens": null,
+    "reasoningTokens": null,
+    "cacheWriteTokens": null,
+    "totalTokens": 7604594,
+    "status": "success",
+    "validated": false
+  }
+]
