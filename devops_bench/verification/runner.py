@@ -78,6 +78,21 @@ _SINGLE_SHOT_WAIT_CEILING_SEC = 120.0
 # path and the single-shot wait-ceiling path in :meth:`VerifierAgent._run_parallel`.
 _PARALLEL_INCOMPLETE_REASON = "evaluation did not complete before the deadline"
 
+# A child's own poll_until always lets an in-flight predicate call finish
+# (it never aborts mid-kubectl-call), so a child that started its last attempt
+# just before ``deadline`` can still return slightly after it. Without slack
+# here, the parent's futures_wait can time out microseconds ahead of that
+# already-in-flight call landing, discarding a real "fail"/"pass" observation
+# as an unobserved "error" purely from thread-scheduling luck -- confirmed
+# live on a `type: all` compound check (rollup() drops "error" entries from
+# both sides of the correctness ratio, so this silently exonerated a real
+# miss). This does not give children a new round to attempt: their own
+# internal deadline is untouched, so this only gives the parent time to
+# collect a result the child was already going to produce anyway. Kept small
+# and deliberately: it should comfortably cover one kubectl call's tail
+# latency, not turn a genuinely hung multi-second child into a false pass.
+_PARALLEL_WAIT_GRACE_SEC = 2.0
+
 
 def _node_name(node: Any) -> str | None:
     """Echo the optional ``name`` label from a spec node, if any."""
@@ -507,10 +522,12 @@ class VerifierAgent:
         to zero budget), so remaining time is not meaningful there and the
         wait uses the ceiling outright. Nested inside a converge round,
         though, ``deadline`` is the real shared deadline, and the wait must
-        not outlive it or a single round can overshoot the converge deadline
-        by up to the ceiling, defeating the total-budget bound; the wait is
-        clamped to whichever of the ceiling and the remaining deadline is
-        smaller.
+        not outlive it by much or a single round can overshoot the converge
+        deadline, defeating the total-budget bound; the non-single_shot wait
+        adds only :data:`_PARALLEL_WAIT_GRACE_SEC` of slack (to catch a
+        child's already-in-flight final call, not to grant a new attempt),
+        and the single_shot wait is clamped to whichever of the ceiling and
+        the remaining deadline is smaller.
         """
         start = time.monotonic()
         results: list[VerificationResult] = [
@@ -535,7 +552,7 @@ class VerifierAgent:
                     else _SINGLE_SHOT_WAIT_CEILING_SEC
                 )
             else:
-                wait_timeout = max(0.0, deadline - time.monotonic())
+                wait_timeout = max(0.0, deadline - time.monotonic()) + _PARALLEL_WAIT_GRACE_SEC
             done, _ = futures_wait(futs, timeout=wait_timeout)
             for f, i in futs.items():
                 if f not in done:
