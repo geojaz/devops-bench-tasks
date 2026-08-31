@@ -107,6 +107,7 @@ class PodExecVerifier(BaseVerifier):
                 selector=self.selector,
                 namespace=self.namespace,
                 kubeconfig=self.kubeconfig,
+                context=self.context,
                 timeout=single_call_timeout(timeout_sec),
             )
         except Exception as exc:  # noqa: BLE001 - a kubectl failure is a check error
@@ -130,6 +131,7 @@ class PodExecVerifier(BaseVerifier):
                 container=self.container,
                 namespace=self.namespace,
                 kubeconfig=self.kubeconfig,
+                context=self.context,
                 timeout=single_call_timeout(timeout_sec),
             )
         except Exception as exc:  # noqa: BLE001 - a kubectl exec failure is a check error

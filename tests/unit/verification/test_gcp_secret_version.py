@@ -67,6 +67,30 @@ def test_state_check_resolves_secret_id_and_compares_state() -> None:
     )
 
 
+def test_get_resource_is_called_with_the_declared_context() -> None:
+    with (
+        patch(
+            "devops_bench.verification.verifiers.gcp_secret_version.get_resource",
+            return_value=_EXTERNAL_SECRET,
+        ) as mock_get,
+        patch(
+            "devops_bench.verification.verifiers.gcp_secret_version.describe_secret_version",
+            return_value={"state": "DISABLED"},
+        ),
+    ):
+        GcpSecretVersionVerifier(
+            project_id="my-project",
+            secret_id_source=_SOURCE,
+            version="1",
+            field="state",
+            op="matches",
+            value="^(DISABLED|DESTROYED)$",
+            context="west",
+        ).verify(timeout_sec=5)
+
+    assert mock_get.call_args.kwargs["context"] == "west"
+
+
 def test_state_check_fails_when_version_still_enabled() -> None:
     with (
         patch(

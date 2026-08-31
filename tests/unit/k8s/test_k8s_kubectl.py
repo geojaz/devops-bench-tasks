@@ -114,6 +114,65 @@ def test_get_resource_with_name(mocker):
     assert argv == ["kubectl", "get", "deployment", "my-dep", "-o", "json"]
 
 
+def test_get_resource_threads_context_into_argv(mocker):
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout=json.dumps({})),
+    )
+
+    kubectl.get_resource("deployment", "my-dep", context="kind-devops-bench-kind")
+
+    argv = mock_run.call_args.args[0]
+    assert argv == [
+        "kubectl",
+        "get",
+        "deployment",
+        "my-dep",
+        "-o",
+        "json",
+        "--context",
+        "kind-devops-bench-kind",
+    ]
+
+
+def test_get_resource_without_context_omits_context_flag(mocker):
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout=json.dumps({})),
+    )
+
+    kubectl.get_resource("deployment", "my-dep")
+
+    argv = mock_run.call_args.args[0]
+    assert "--context" not in argv
+
+
+def test_exec_pod_threads_context_into_argv(mocker):
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed(stdout="ok"))
+
+    kubectl.exec_pod("my-pod", ["true"], context="kind-devops-bench-kind")
+
+    argv = mock_run.call_args.args[0]
+    assert argv == [
+        "kubectl",
+        "exec",
+        "my-pod",
+        "--context",
+        "kind-devops-bench-kind",
+        "--",
+        "true",
+    ]
+
+
+def test_exec_pod_without_context_omits_context_flag(mocker):
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed(stdout="ok"))
+
+    kubectl.exec_pod("my-pod", ["true"])
+
+    argv = mock_run.call_args.args[0]
+    assert "--context" not in argv
+
+
 def test_apply_builds_argv(mocker):
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 

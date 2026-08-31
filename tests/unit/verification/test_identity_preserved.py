@@ -54,6 +54,22 @@ def test_matching_uid_and_timestamp_passes() -> None:
     assert result.success is True
 
 
+def test_get_resource_is_called_with_the_declared_context() -> None:
+    dep = _deployment(
+        "abc-123",
+        "2026-01-01T00:00:00Z",
+        {_KEY_UID: "abc-123", _KEY_CREATED: "2026-01-01T00:00:00Z"},
+    )
+    with patch(
+        "devops_bench.verification.verifiers.identity_preserved.get_resource", return_value=dep
+    ) as mock_get:
+        IdentityPreservedVerifier(
+            kind="Deployment", resource_name="web-gateway", context="west"
+        ).verify(timeout_sec=0)
+
+    assert mock_get.call_args.kwargs["context"] == "west"
+
+
 def test_changed_uid_fails_deleted_and_recreated() -> None:
     # A delete+recreate keeps the same annotation value (if copied forward) but
     # the server assigns a brand-new uid; a mismatch is the tell.

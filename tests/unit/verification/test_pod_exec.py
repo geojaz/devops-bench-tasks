@@ -45,6 +45,38 @@ def test_resource_name_target_execs_directly() -> None:
     assert mock_exec.call_args.args[0] == "prober"
 
 
+def test_exec_pod_is_called_with_the_declared_context() -> None:
+    completed = SimpleNamespace(stdout="nginx/1.27.4\n")
+    with patch(
+        "devops_bench.verification.verifiers.pod_exec.exec_pod", return_value=completed
+    ) as mock_exec:
+        PodExecVerifier(
+            resource_name="prober",
+            command=["nginx", "-v"],
+            op="contains",
+            value="1.27.4",
+            context="west",
+        ).verify(timeout_sec=5)
+
+    assert mock_exec.call_args.kwargs["context"] == "west"
+
+
+def test_get_resource_for_selector_resolution_is_called_with_the_declared_context() -> None:
+    pods = {"items": [{"metadata": {"name": "a-pod"}}]}
+    completed = SimpleNamespace(stdout="OK\n")
+    with (
+        patch(
+            "devops_bench.verification.verifiers.pod_exec.get_resource", return_value=pods
+        ) as mock_get,
+        patch("devops_bench.verification.verifiers.pod_exec.exec_pod", return_value=completed),
+    ):
+        PodExecVerifier(
+            selector="app=probe", command=["cat", "status"], op="eq", value="OK", context="west"
+        ).verify(timeout_sec=5)
+
+    assert mock_get.call_args.kwargs["context"] == "west"
+
+
 def test_selector_resolves_to_first_pod_by_name() -> None:
     pods = {"items": [{"metadata": {"name": "b-pod"}}, {"metadata": {"name": "a-pod"}}]}
     completed = SimpleNamespace(stdout="OK\n")
