@@ -160,20 +160,37 @@ verification_spec:
       value: "compromised-password-v1"
   # A length floor, not a generation method: closes "secure value" as an
   # ambiguous, judge-narrated claim without prescribing how to produce one.
+  # Compound with the same "actually changed" clause new-secret-version-created
+  # uses -- a bare length check on 'latest' passes vacuously on an untouched
+  # environment, since the seeded compromised value is itself 23 characters
+  # (confirmed live: a fully passive agent's no-op run still passed this).
   - name: "new-secret-value-not-trivial"
     role: objective
     check:
-      type: gcp_secret_version
-      project_id: "{{PROJECT_ID}}"
-      secret_id_source:
-        kind: ExternalSecret
-        selector: "app=db-credentials"
-        namespace: "{{NAMESPACE}}"
-        path: 'spec.data[0].remoteRef.key'
-      version: latest
-      field: payload
-      op: matches
-      value: "^.{16,}$"
+      type: all
+      checks:
+      - type: gcp_secret_version
+        project_id: "{{PROJECT_ID}}"
+        secret_id_source:
+          kind: ExternalSecret
+          selector: "app=db-credentials"
+          namespace: "{{NAMESPACE}}"
+          path: 'spec.data[0].remoteRef.key'
+        version: latest
+        field: payload
+        op: ne
+        value: "compromised-password-v1"
+      - type: gcp_secret_version
+        project_id: "{{PROJECT_ID}}"
+        secret_id_source:
+          kind: ExternalSecret
+          selector: "app=db-credentials"
+          namespace: "{{NAMESPACE}}"
+          path: 'spec.data[0].remoteRef.key'
+        version: latest
+        field: payload
+        op: matches
+        value: "^.{16,}$"
   - name: "old-secret-version-revoked"
     role: objective
     check:
@@ -212,16 +229,35 @@ verification_spec:
       command: ["cat", "/etc/db-credentials/password"]
       op: ne
       value: "compromised-password-v1"
+  # Compound with the same "actually changed" clause new-secret-version-created
+  # uses -- readyReplicas==2 is the steady-state value before any incident
+  # response too, so a fully passive agent's untouched deployment passes this
+  # vacuously (confirmed live). Pairing it with genuine rotation makes the
+  # check mean what its name says: rolled out *with the new secret*, not just
+  # "happens to be healthy right now."
   - name: "deployment-fully-rolled-out"
     role: objective
     check:
-      type: resource_property
-      kind: Deployment
-      selector: "app=db-secret-viewer"
-      namespace: "{{NAMESPACE}}"
-      path: "status.readyReplicas"
-      op: eq
-      value: 2
+      type: all
+      checks:
+      - type: resource_property
+        kind: Deployment
+        selector: "app=db-secret-viewer"
+        namespace: "{{NAMESPACE}}"
+        path: "status.readyReplicas"
+        op: eq
+        value: 2
+      - type: gcp_secret_version
+        project_id: "{{PROJECT_ID}}"
+        secret_id_source:
+          kind: ExternalSecret
+          selector: "app=db-credentials"
+          namespace: "{{NAMESPACE}}"
+          path: 'spec.data[0].remoteRef.key'
+        version: latest
+        field: payload
+        op: ne
+        value: "compromised-password-v1"
   # The stack seeds two uncompromised sibling secrets ("cache-credentials",
   # "webhook-signing-key"), each with their own ExternalSecret and consumer
   # Deployment, in the same namespace. The incident report only names the
