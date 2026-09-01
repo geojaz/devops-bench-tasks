@@ -6,8 +6,8 @@
     "augmentation": [
       "mcp"
     ],
-    "runId": "run_20260829_024356_20260829-024345-1894188",
-    "t": "2026-08-29T03:19:05Z",
+    "runId": "run_20260901_064033_20260901-064030-2174829",
+    "t": "2026-09-01T07:12:26Z",
     "taskFolder": "multi-region-failover",
     "taskName": "multi-region-failover",
     "iteration": 0,
@@ -17,13 +17,13 @@
     "catastrophic": false,
     "scoringVersion": "v1",
     "toolScore": 1.0,
-    "latencySec": 427.4747747441288,
-    "inputTokens": 900787,
-    "outputTokens": 26054,
+    "latencySec": 497.3350854483433,
+    "inputTokens": 886933,
+    "outputTokens": 16924,
     "cachedTokens": null,
     "reasoningTokens": null,
     "cacheWriteTokens": null,
-    "totalTokens": 7604594,
+    "totalTokens": 6741039,
     "status": "success",
     "validated": false
   }
