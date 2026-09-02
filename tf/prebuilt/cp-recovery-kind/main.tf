@@ -74,6 +74,8 @@ resource "helm_release" "workloads" {
   chart            = "${path.module}/cp-recovery-chart"
   namespace        = var.namespace
   create_namespace = true
+  # Image pulls through a shared NAT egress can exceed the 300 s provider default; the item budget is 45 min.
+  timeout = 900
 
   set {
     name  = "namespace"
