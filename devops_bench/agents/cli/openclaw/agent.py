@@ -182,6 +182,26 @@ _PROVIDER_RUNTIME: dict[str, str] = {
     "openai": "openclaw",
 }
 
+# Session and subagent tools need an authenticated gateway websocket, which a
+# one-shot `oc agent --local` run never has. Without this deny list the model
+# can call sessions_spawn (which reports accepted even though the child dies
+# on a credentials error) and then sessions_yield, ending its turn with no
+# work done. Deny them so the agent does the task in its own turn.
+_SUBAGENT_TOOL_DENY: tuple[str, ...] = (
+    "sessions_spawn",
+    "sessions_yield",
+    "sessions_send",
+    "sessions_list",
+    "sessions_history",
+    "sessions_search",
+    "subagents",
+)
+
+
+def _build_tool_policy() -> dict:
+    return {"tools": {"deny": list(_SUBAGENT_TOOL_DENY)}}
+
+
 # Levels ``oc agent --thinking`` accepts.
 _THINKING_LEVELS = frozenset(
     {"off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"}
@@ -305,11 +325,13 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
 
     Merges the per-run config concerns the harness owns: command-bearing MCP
     bindings (``mcp.servers``), a catalog entry for a model openclaw doesn't ship
-    by default (``models``/``agents``; see :func:`_build_model_override`), and an
+    by default (``models``/``agents``; see :func:`_build_model_override`), an
     agent-runtime pin for a provider oc would otherwise misroute (``agents``; see
-    :func:`_build_runtime_pin`). The model-override and runtime-pin payloads are
-    deep-merged (via :func:`_deep_merge`) rather than shallow-updated, since both
-    can write into the same ``agents.defaults.models[model_id]`` entry.
+    :func:`_build_runtime_pin`), and the session/subagent tool deny list every run
+    needs (``tools``; see :func:`_build_tool_policy`). The model-override and
+    runtime-pin payloads are deep-merged (via :func:`_deep_merge`) rather than
+    shallow-updated, since both can write into the same
+    ``agents.defaults.models[model_id]`` entry.
 
     Args:
         config: Resolved :class:`AgentConfig` (drives the model-catalog entry and
@@ -318,10 +340,9 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
             bindings are skipped by :func:`build_mcp_servers`).
 
     Returns:
-        A config mapping, or an empty dict when there is no launchable MCP
-        binding, no model needing a catalog entry, and no model needing a
-        runtime pin (caller then skips the config write and leaves
-        ``OPENCLAW_CONFIG_PATH`` unset).
+        A config mapping. Never empty: the tool-policy deny list (see
+        :func:`_build_tool_policy`) is always merged in, on top of any MCP
+        servers, model-catalog entry, and runtime pin.
 
     Each MCP server entry inherits the run's ``KUBECONFIG`` (set by ``RunEnv``) as
     an explicit ``env`` so the MCP server (e.g. gke-mcp) reads the run-scoped
@@ -337,6 +358,7 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
         payload["mcp"] = {"servers": servers}
     _deep_merge(payload, _build_model_override(config))
     _deep_merge(payload, _build_runtime_pin(config))
+    _deep_merge(payload, _build_tool_policy())
     return payload
 
 
