@@ -499,6 +499,7 @@ def test_execute_agent_chowns_workspace_and_kubeconfig_to_agent_uid(
         harness = DefaultEvalHarness(
             project_id="p", cluster_name="c", agent_type="fake-chown-probe", no_infra=True
         )
+        monkeypatch.setattr(harness_default.os, "geteuid", lambda: 0)
         monkeypatch.setattr(harness_default, "resolve_agent_identity", lambda: (2000, 2000))
         chowned_trees: list[tuple[Path, int, int]] = []
         monkeypatch.setattr(
@@ -543,6 +544,7 @@ def test_execute_agent_chowns_back_to_root_after_the_agent_succeeds(
         harness = DefaultEvalHarness(
             project_id="p", cluster_name="c", agent_type="fake-chown-back-probe", no_infra=True
         )
+        monkeypatch.setattr(harness_default.os, "geteuid", lambda: 0)
         monkeypatch.setattr(harness_default, "resolve_agent_identity", lambda: (2000, 2000))
         chowned_trees: list[tuple[Path, int, int]] = []
         monkeypatch.setattr(
@@ -600,6 +602,7 @@ def test_execute_agent_chowns_back_to_root_even_when_the_agent_raises(
             agent_type="fake-chown-back-on-error-probe",
             no_infra=True,
         )
+        monkeypatch.setattr(harness_default.os, "geteuid", lambda: 0)
         monkeypatch.setattr(harness_default, "resolve_agent_identity", lambda: (2000, 2000))
         chowned_trees: list[tuple[Path, int, int]] = []
         monkeypatch.setattr(
@@ -657,6 +660,128 @@ def test_execute_agent_raises_and_never_chowns_when_agent_identity_is_missing(
         assert chowned_trees == []
     finally:
         AGENTS._items.pop("fake-missing-identity-probe", None)  # noqa: SLF001
+
+
+def test_execute_agent_skips_ownership_hand_off_when_not_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """In docker sandbox mode the harness runs as the operator (euid != 0), so
+    the workspace/kubeconfig hand-off/hand-back is a no-op: no chown of any
+    kind runs, and the agent's result still comes back untouched.
+    """
+    AGENTS.register("fake-non-root-probe")(_WorkspaceWritingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p", cluster_name="c", agent_type="fake-non-root-probe", no_infra=True
+        )
+        monkeypatch.setattr(harness_default.os, "geteuid", lambda: 1000)
+        monkeypatch.setattr(harness_default, "resolve_agent_identity", lambda: (1000, 1000))
+        chowned_trees: list[tuple[Path, int, int]] = []
+        monkeypatch.setattr(
+            harness_default,
+            "_chown_tree",
+            lambda path, uid, gid: chowned_trees.append((path, uid, gid)),
+        )
+        os_chowned: list[tuple[Path, int, int]] = []
+        monkeypatch.setattr(
+            harness_default.os,
+            "chown",
+            lambda path, uid, gid: os_chowned.append((Path(path), uid, gid)),
+        )
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        kubeconfig = tmp_path / "kubeconfig"
+        kubeconfig.write_text("apiVersion: v1")
+
+        cluster = ClusterInfo(name="c", kubeconfig_path=str(kubeconfig))
+        ctx = RunContext(task_id="t", workspace_path=workspace, cluster=cluster)
+
+        result = harness.execute_agent("prompt", ctx)
+
+        assert chowned_trees == []
+        assert os_chowned == []
+        assert result.output == "wrote a file"
+    finally:
+        AGENTS._items.pop("fake-non-root-probe", None)  # noqa: SLF001
+
+
+def test_execute_agent_returns_result_when_hand_back_fails_after_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hand-back failure after the agent's turn already completed is logged,
+    not fatal: the ``AgentResult`` the agent produced is the primary artefact
+    of the task and must not be discarded by a permission error on the way
+    back to root ownership.
+    """
+    AGENTS.register("fake-hand-back-fails-probe")(_WorkspaceWritingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p",
+            cluster_name="c",
+            agent_type="fake-hand-back-fails-probe",
+            no_infra=True,
+        )
+        monkeypatch.setattr(harness_default.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(harness_default, "resolve_agent_identity", lambda: (2000, 2000))
+
+        def _chown_tree(path: Path, uid: int, gid: int) -> None:
+            if (uid, gid) == (0, 0):
+                raise PermissionError(1, "Operation not permitted", str(path))
+
+        monkeypatch.setattr(harness_default, "_chown_tree", _chown_tree)
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        ctx = RunContext(task_id="t", workspace_path=workspace, cluster=None)
+
+        with caplog.at_level(logging.ERROR, logger="evalharness.default"):
+            result = harness.execute_agent("prompt", ctx)
+
+        assert result.output == "wrote a file"
+        assert any(
+            "hand ownership" in record.message and record.levelno == logging.ERROR
+            for record in caplog.records
+        )
+    finally:
+        AGENTS._items.pop("fake-hand-back-fails-probe", None)  # noqa: SLF001
+
+
+def test_execute_agent_propagates_agent_exception_when_hand_back_also_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the agent's own turn raises and the hand-back chown also fails,
+    the agent's exception is what propagates: it is the more actionable
+    failure, and the hand-back failure is logged rather than masking it.
+    """
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c", no_infra=True)
+    monkeypatch.setattr(harness_default.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(harness_default, "resolve_agent_identity", lambda: (2000, 2000))
+
+    class _StubAgent:
+        def run(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            raise RuntimeError("agent turn blew up for real")
+
+    monkeypatch.setattr(harness, "resolve_agent", lambda agent_type: _StubAgent())
+
+    def _chown_tree(path: Path, uid: int, gid: int) -> None:
+        if (uid, gid) == (0, 0):
+            raise PermissionError(1, "Operation not permitted", str(path))
+
+    monkeypatch.setattr(harness_default, "_chown_tree", _chown_tree)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = RunContext(task_id="t", workspace_path=workspace, cluster=None)
+
+    with caplog.at_level(logging.ERROR, logger="evalharness.default"):
+        with pytest.raises(RuntimeError, match="agent turn blew up for real"):
+            harness.execute_agent("prompt", ctx)
+
+    assert any(
+        "hand ownership" in record.message and record.levelno == logging.ERROR
+        for record in caplog.records
+    )
 
 
 def test_run_one_collects_files_the_agent_writes_to_its_workspace(

@@ -111,9 +111,12 @@ def _chown_tree(path: Path, uid: int, gid: int) -> None:
     read the results without a permission error.
 
     Raises:
-        OSError: If any chown fails. Never swallowed: a workspace the agent
-            cannot write to, or that the harness cannot read back, must abort
-            the task rather than proceed silently degraded.
+        OSError: If any chown fails. Not swallowed here: it is the caller's
+            job to decide whether a failure aborts the task. A pre-turn
+            failure (workspace the agent cannot write to) still aborts; a
+            post-turn hand-back failure on an already-completed turn is
+            logged by the caller instead of raised, so the trajectory is not
+            discarded.
     """
     os.chown(path, uid, gid)
     for root, dirs, files in os.walk(path):
@@ -916,16 +919,24 @@ class DefaultEvalHarness(Harness):
         harness's spawn), but it still needs to write into its workspace and
         read the cluster kubeconfig the CLI wrapper's own kubectl calls
         depend on. Both are root-owned before this method runs (the
-        harness/tofu/kubectl path), so ownership is hand off to the agent
+        harness/tofu/kubectl path), so ownership is handed off to the agent
         uid for the duration of the turn and handed back to root
         afterward, mirroring the recursive chown-back idiom in
         :func:`devops_bench.agents.sandbox.wrap_argv` (there via a shell
         ``chown -R`` on container exit; here in-process via ``os.chown``,
-        since there is no container to run it in). Handing ownership back
-        is unconditional (``finally``): the post-agent pipeline
-        (``collect_generated_files``, verification's own kubectl calls)
-        still runs as root and would otherwise start hitting permission
-        errors on a workspace/kubeconfig left agent-owned.
+        since there is no container to run it in). This hand-off/hand-back
+        only happens when the harness itself is running as root
+        (``os.geteuid() == 0``): in docker sandbox mode the harness runs as
+        the operator and the agent identity resolves to that same uid, so
+        the chowns would be a no-op at best and an ``EPERM`` at worst. A
+        hand-back failure after the agent's turn has already completed is
+        logged, not fatal: the trajectory ``agent.run`` returned is the
+        primary artefact of the task, and discarding it by raising out of
+        this method (as a bare ``finally`` used to do) voids the run for no
+        benefit, since the post-agent pipeline can still fail loudly later
+        on its own permission errors if the hand-back really left things
+        unreadable. A hand-back failure while an agent exception is already
+        propagating is logged and the agent's exception still wins.
 
         Args:
             prompt: The (placeholder-resolved) task prompt.
@@ -940,7 +951,9 @@ class DefaultEvalHarness(Harness):
         Raises:
             AgentIdentityError: If the benchagent uid/gid does not exist on
                 this host. Never falls back to running the agent as root.
-            OSError: If a chown fails, before or after the agent's turn.
+            OSError: If the pre-turn hand-off chown fails, or if the agent's
+                own turn raises. A post-turn hand-back failure after a
+                completed turn is logged rather than raised.
         """
         agent = self.resolve_agent(self.agent_type)
         agent_uid, agent_gid = resolve_agent_identity()
@@ -948,24 +961,57 @@ class DefaultEvalHarness(Harness):
         workspace_path = ctx.workspace_path
         kubeconfig_path = Path(ctx.kubeconfig_path) if ctx.kubeconfig_path else None
         kubeconfig_present = kubeconfig_path is not None and kubeconfig_path.exists()
+        hand_off = os.geteuid() == 0
 
-        if workspace_path is not None:
-            _chown_tree(workspace_path, agent_uid, agent_gid)
-        if kubeconfig_present:
-            # Mode 0600, not 0640: the kubeconfig carries the cluster's
-            # client credential, and the agent uid is the only reader that
-            # needs it during the turn (root regains ownership, and with it
-            # read access, in the finally block below).
-            os.chown(kubeconfig_path, agent_uid, agent_gid)
-            kubeconfig_path.chmod(0o600)
+        if not hand_off:
+            _log.info(
+                "harness is not root (euid %d); skipping workspace "
+                "ownership hand-off (sandbox mode or same-uid agent)",
+                os.geteuid(),
+            )
+        else:
+            if workspace_path is not None:
+                _chown_tree(workspace_path, agent_uid, agent_gid)
+            if kubeconfig_present:
+                # Mode 0600, not 0640: the kubeconfig carries the cluster's
+                # client credential, and the agent uid is the only reader
+                # that needs it during the turn (root regains ownership,
+                # and with it read access, in the hand-back below).
+                os.chown(kubeconfig_path, agent_uid, agent_gid)
+                kubeconfig_path.chmod(0o600)
+
+        def _hand_back() -> OSError | None:
+            """Chown ``workspace_path``/``kubeconfig_path`` back to root.
+
+            Returns the ``OSError`` instead of raising it so the caller can
+            decide whether a failure here should be fatal (only when it
+            would otherwise mask a still-propagating agent exception).
+            """
+            try:
+                if workspace_path is not None:
+                    _chown_tree(workspace_path, 0, 0)
+                if kubeconfig_present:
+                    os.chown(kubeconfig_path, 0, 0)
+            except OSError as exc:
+                _log.error(
+                    "failed to hand ownership of %s back to root",
+                    workspace_path,
+                    exc_info=True,
+                )
+                return exc
+            return None
+
+        if not hand_off:
+            return agent.run(prompt, workspace_path=workspace_path)
 
         try:
-            return agent.run(prompt, workspace_path=workspace_path)
-        finally:
-            if workspace_path is not None:
-                _chown_tree(workspace_path, 0, 0)
-            if kubeconfig_present:
-                os.chown(kubeconfig_path, 0, 0)
+            result = agent.run(prompt, workspace_path=workspace_path)
+        except Exception:
+            _hand_back()
+            raise
+
+        _hand_back()
+        return result
 
     # -- pipeline ---------------------------------------------------------
 
