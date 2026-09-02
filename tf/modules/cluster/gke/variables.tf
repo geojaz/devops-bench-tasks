@@ -32,6 +32,8 @@ variable "node_count" {
   description = "Number of nodes in the standard pool"
   type        = number
   default     = 3
+  # A null from a caller falls back to the default instead of reaching node_count on the node pool as null.
+  nullable = false
 }
 
 variable "machine_type" {

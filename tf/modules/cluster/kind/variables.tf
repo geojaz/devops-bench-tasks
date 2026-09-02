@@ -45,6 +45,8 @@ variable "node_count" {
   type        = number
   description = "Number of nodes (1 control-plane + worker nodes)"
   default     = 3
+  # A null from a caller falls back to the default instead of poisoning range() in the kind module.
+  nullable = false
 }
 
 variable "disable_default_cni" {
