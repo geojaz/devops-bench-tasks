@@ -928,14 +928,18 @@ class DefaultEvalHarness(Harness):
         only happens when the harness itself is running as root
         (``os.geteuid() == 0``): in docker sandbox mode the harness runs as
         the operator and the agent identity resolves to that same uid, so
-        the chowns would be a no-op at best and an ``EPERM`` at worst. A
+        the chowns would be a no-op at best and an ``EPERM`` at worst. The
+        workspace and kubeconfig hand-backs are attempted independently, so
+        one failing does not stop the other from being attempted. A
         hand-back failure after the agent's turn has already completed is
         logged, not fatal: the trajectory ``agent.run`` returned is the
-        primary artefact of the task, and discarding it by raising out of
-        this method (as a bare ``finally`` used to do) voids the run for no
-        benefit, since the post-agent pipeline can still fail loudly later
-        on its own permission errors if the hand-back really left things
-        unreadable. A hand-back failure while an agent exception is already
+        primary artefact of the task and is still returned as the result,
+        since discarding it by raising out of this method (as a bare
+        ``finally`` used to do) voids the run for no benefit. In particular,
+        a failed kubeconfig hand-back leaves the kubeconfig owned by the
+        agent uid on disk, readable only by that uid, until the next run
+        re-chowns it; this is logged at ERROR so it is not silently carried
+        forward. A hand-back failure while an agent exception is already
         propagating is logged and the agent's exception still wins.
 
         Args:
@@ -951,9 +955,11 @@ class DefaultEvalHarness(Harness):
         Raises:
             AgentIdentityError: If the benchagent uid/gid does not exist on
                 this host. Never falls back to running the agent as root.
-            OSError: If the pre-turn hand-off chown fails, or if the agent's
-                own turn raises. A post-turn hand-back failure after a
-                completed turn is logged rather than raised.
+            OSError: If the pre-turn hand-off chown fails.
+
+        The agent's own turn (``agent.run``) may raise any exception; it
+        propagates unchanged, of whatever type the agent raises, and is not
+        wrapped or reclassified here.
         """
         agent = self.resolve_agent(self.agent_type)
         agent_uid, agent_gid = resolve_agent_identity()
@@ -961,6 +967,10 @@ class DefaultEvalHarness(Harness):
         workspace_path = ctx.workspace_path
         kubeconfig_path = Path(ctx.kubeconfig_path) if ctx.kubeconfig_path else None
         kubeconfig_present = kubeconfig_path is not None and kubeconfig_path.exists()
+        # Bound to a non-None local once ``kubeconfig_present`` is true so
+        # every later use is on a value the type checker can see is a
+        # ``Path``, not ``Path | None``.
+        kubeconfig_target: Path | None = kubeconfig_path if kubeconfig_present else None
         hand_off = os.geteuid() == 0
 
         if not hand_off:
@@ -972,34 +982,49 @@ class DefaultEvalHarness(Harness):
         else:
             if workspace_path is not None:
                 _chown_tree(workspace_path, agent_uid, agent_gid)
-            if kubeconfig_present:
+            if kubeconfig_target is not None:
                 # Mode 0600, not 0640: the kubeconfig carries the cluster's
                 # client credential, and the agent uid is the only reader
                 # that needs it during the turn (root regains ownership,
                 # and with it read access, in the hand-back below).
-                os.chown(kubeconfig_path, agent_uid, agent_gid)
-                kubeconfig_path.chmod(0o600)
+                os.chown(kubeconfig_target, agent_uid, agent_gid)
+                kubeconfig_target.chmod(0o600)
 
         def _hand_back() -> OSError | None:
             """Chown ``workspace_path``/``kubeconfig_path`` back to root.
 
-            Returns the ``OSError`` instead of raising it so the caller can
-            decide whether a failure here should be fatal (only when it
-            would otherwise mask a still-propagating agent exception).
+            The workspace and kubeconfig hand-backs are attempted
+            independently, so a failure on one does not prevent the other
+            from being attempted. Returns the last ``OSError`` encountered
+            instead of raising it so the caller can decide whether a
+            failure here should be fatal (only when it would otherwise mask
+            a still-propagating agent exception).
             """
-            try:
-                if workspace_path is not None:
+            last_exc: OSError | None = None
+            if workspace_path is not None:
+                try:
                     _chown_tree(workspace_path, 0, 0)
-                if kubeconfig_present:
-                    os.chown(kubeconfig_path, 0, 0)
-            except OSError as exc:
-                _log.error(
-                    "failed to hand ownership of %s back to root",
-                    workspace_path,
-                    exc_info=True,
-                )
-                return exc
-            return None
+                except OSError as exc:
+                    _log.error(
+                        "Failed to hand workspace %s back to root after "
+                        "agent turn; leaving it agent-owned",
+                        workspace_path,
+                        exc_info=True,
+                    )
+                    last_exc = exc
+            if kubeconfig_target is not None:
+                try:
+                    os.chown(kubeconfig_target, 0, 0)
+                except OSError as exc:
+                    _log.error(
+                        "Failed to hand kubeconfig %s back to root after "
+                        "agent turn; credential remains owned by uid %d",
+                        kubeconfig_target,
+                        agent_uid,
+                        exc_info=True,
+                    )
+                    last_exc = exc
+            return last_exc
 
         if not hand_off:
             return agent.run(prompt, workspace_path=workspace_path)

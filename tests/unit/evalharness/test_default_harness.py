@@ -706,13 +706,14 @@ def test_execute_agent_skips_ownership_hand_off_when_not_root(
         AGENTS._items.pop("fake-non-root-probe", None)  # noqa: SLF001
 
 
-def test_execute_agent_returns_result_when_hand_back_fails_after_success(
+def test_execute_agent_returns_result_when_workspace_hand_back_fails_after_success(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A hand-back failure after the agent's turn already completed is logged,
-    not fatal: the ``AgentResult`` the agent produced is the primary artefact
-    of the task and must not be discarded by a permission error on the way
-    back to root ownership.
+    """A workspace hand-back failure after the agent's turn already completed
+    is logged, not fatal: the ``AgentResult`` the agent produced is the
+    primary artefact of the task and must not be discarded by a permission
+    error on the way back to root ownership. Only the workspace chown-back
+    fails here, so the log message names the workspace specifically.
     """
     AGENTS.register("fake-hand-back-fails-probe")(_WorkspaceWritingAgent)
     try:
@@ -740,11 +741,56 @@ def test_execute_agent_returns_result_when_hand_back_fails_after_success(
 
         assert result.output == "wrote a file"
         assert any(
-            "hand ownership" in record.message and record.levelno == logging.ERROR
+            "Failed to hand workspace" in record.message and record.levelno == logging.ERROR
             for record in caplog.records
         )
     finally:
         AGENTS._items.pop("fake-hand-back-fails-probe", None)  # noqa: SLF001
+
+
+def test_execute_agent_returns_result_when_kubeconfig_hand_back_fails_after_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A kubeconfig hand-back failure after the agent's turn already completed
+    is logged, not fatal, and the workspace hand-back is still attempted (and
+    succeeds) independently. Only the kubeconfig chown-back fails here, so
+    the log message names the kubeconfig specifically.
+    """
+    AGENTS.register("fake-kubeconfig-hand-back-fails-probe")(_WorkspaceWritingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p",
+            cluster_name="c",
+            agent_type="fake-kubeconfig-hand-back-fails-probe",
+            no_infra=True,
+        )
+        monkeypatch.setattr(harness_default.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(harness_default, "resolve_agent_identity", lambda: (2000, 2000))
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        kubeconfig = tmp_path / "kubeconfig"
+        kubeconfig.write_text("apiVersion: v1")
+
+        def _os_chown(path: Path, uid: int, gid: int) -> None:
+            if str(path) == str(kubeconfig) and (uid, gid) == (0, 0):
+                raise PermissionError(1, "Operation not permitted", str(path))
+
+        monkeypatch.setattr(harness_default.os, "chown", _os_chown)
+
+        cluster = ClusterInfo(name="c", kubeconfig_path=str(kubeconfig))
+        ctx = RunContext(task_id="t", workspace_path=workspace, cluster=cluster)
+
+        with caplog.at_level(logging.ERROR, logger="evalharness.default"):
+            result = harness.execute_agent("prompt", ctx)
+
+        assert result.output == "wrote a file"
+        assert any(
+            "Failed to hand kubeconfig" in record.message and record.levelno == logging.ERROR
+            for record in caplog.records
+        )
+    finally:
+        AGENTS._items.pop("fake-kubeconfig-hand-back-fails-probe", None)  # noqa: SLF001
 
 
 def test_execute_agent_propagates_agent_exception_when_hand_back_also_fails(
@@ -779,7 +825,7 @@ def test_execute_agent_propagates_agent_exception_when_hand_back_also_fails(
             harness.execute_agent("prompt", ctx)
 
     assert any(
-        "hand ownership" in record.message and record.levelno == logging.ERROR
+        "Failed to hand workspace" in record.message and record.levelno == logging.ERROR
         for record in caplog.records
     )
 
