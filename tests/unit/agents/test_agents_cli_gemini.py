@@ -200,6 +200,46 @@ def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
         _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertyx"))
 
 
+def test_build_env_forwards_vertex_passthrough_envs_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "p")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
+    assert env["GOOGLE_CLOUD_PROJECT"] == "p"
+    assert env["GOOGLE_CLOUD_LOCATION"] == "global"
+    assert env["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+
+
+def test_build_env_omits_vertex_passthrough_envs_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for var in gemini_mod._VERTEX_PASSTHROUGH_ENVS:
+        monkeypatch.delenv(var, raising=False)
+    env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
+    assert not set(gemini_mod._VERTEX_PASSTHROUGH_ENVS) & env.keys()
+
+
+def test_build_env_always_sets_trust_workspace() -> None:
+    env = _build_env(AgentConfig(model="gemini-2.5-pro"))
+    assert env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
+
+
+def test_build_env_extra_env_overrides_vertex_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "ambient")
+    env = _build_env(
+        AgentConfig(
+            model="gemini-2.5-pro",
+            provider="google-vertex",
+            extra_env={"GOOGLE_CLOUD_PROJECT": "explicit"},
+        )
+    )
+    assert env["GOOGLE_CLOUD_PROJECT"] == "explicit"
+
+
 def test_gemini_agent_registered_under_canonical_key() -> None:
     assert AGENTS.get("gemini") is GeminiCliAgent
 

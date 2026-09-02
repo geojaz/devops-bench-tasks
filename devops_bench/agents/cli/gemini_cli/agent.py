@@ -71,6 +71,21 @@ _GEMINI_SKILLS_DIR = "skills"
 
 _log = get_logger("agents.cli.gemini_cli")
 
+# Keyless Vertex/ADC selectors. The docker sandbox forwards env by name only
+# (sandbox.wrap_argv emits bare `-e KEY` flags; values cross via run_as_agent's
+# extra_env), so a keyless google-vertex run needs these copied from the
+# ambient env explicitly, the same way openclaw's vertex_passthrough does.
+# GOOGLE_CLOUD_API_KEY is a credential and crosses by name only, like the
+# other provider api_key_envs: never rendered into argv or logs.
+_VERTEX_PASSTHROUGH_ENVS: tuple[str, ...] = (
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+    "GCP_PROJECT_ID",
+    "GCP_VERTEX_LOCATION",
+    "GOOGLE_CLOUD_API_KEY",
+)
+
 
 def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool) -> dict:
     """Assemble the Gemini ``settings.json`` payload for a run.
@@ -163,6 +178,15 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     flows from ``config.model``. A keyless backend (e.g. Vertex/ADC) writes no
     key.
 
+    Any of :data:`_VERTEX_PASSTHROUGH_ENVS` present in the ambient env are
+    copied into the overlay before ``config.extra_env`` is applied, so an
+    explicit ``config.extra_env`` value still wins on overlap. This matters
+    only for the docker sandbox, which forwards env by name and would
+    otherwise drop the Vertex transport vars a keyless run needs. ``overlay``
+    also unconditionally sets ``GEMINI_CLI_TRUST_WORKSPACE`` so headless runs
+    (which already pass ``--approval-mode yolo``) are not blocked by the
+    CLI's untrusted-directory check.
+
     Args:
         config: Resolved :class:`AgentConfig` for this run.
 
@@ -182,7 +206,15 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         "OTEL_METRICS_EXPORTER": "none",
         "OTEL_LOGS_EXPORTER": "none",
         "OTEL_SDK_DISABLED": "true",
+        # Headless runs already pass `--approval-mode yolo`; gemini-cli >= 0.5x
+        # otherwise refuses to run in an untrusted (fresh workspace) directory.
+        # Harmless on the non-sandboxed host path too.
+        "GEMINI_CLI_TRUST_WORKSPACE": "true",
     }
+    for var in _VERTEX_PASSTHROUGH_ENVS:
+        value = os.environ.get(var)
+        if value:
+            overlay[var] = value
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
