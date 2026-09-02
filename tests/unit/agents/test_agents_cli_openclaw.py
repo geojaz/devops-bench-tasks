@@ -41,6 +41,8 @@ from devops_bench.agents.cli.openclaw.agent import (
     _build_local_command,
     _build_model_override,
     _build_openclaw_config,
+    _build_runtime_pin,
+    _deep_merge,
     _oc_model_id,
 )
 from devops_bench.agents.cli.openclaw.parsing import _pick_session_key, _strip_ansi
@@ -919,6 +921,62 @@ def test_model_override_raises_for_unpinned_transport():
     fallback). A full-id with an unknown wire reaches this path."""
     with pytest.raises(ConfigError):
         _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash"))
+
+
+# ---------------------------------------------------------------------------
+# Agent-runtime pin: providers oc would otherwise misroute to an unavailable
+# harness plugin (e.g. openai → codex) get an explicit ``agentRuntime`` pin.
+# ---------------------------------------------------------------------------
+
+
+def test_build_openclaw_config_pins_runtime_for_openai_model():
+    cfg = AgentConfig(model="gpt-5.6-sol", provider="openai")
+    assert _build_openclaw_config(cfg, ()) == {
+        "agents": {"defaults": {"models": {"openai/gpt-5.6-sol": {"agentRuntime": {"id": "openclaw"}}}}}
+    }
+
+
+def test_build_runtime_pin_pins_openai_to_openclaw_runtime():
+    cfg = AgentConfig(model="gpt-5.6-sol", provider="openai")
+    assert _build_runtime_pin(cfg) == {
+        "agents": {"defaults": {"models": {"openai/gpt-5.6-sol": {"agentRuntime": {"id": "openclaw"}}}}}
+    }
+
+
+def test_build_runtime_pin_empty_for_unpinned_provider():
+    assert _build_runtime_pin(AgentConfig(model="gemini-2.5-pro", provider="gemini")) == {}
+
+
+def test_build_runtime_pin_empty_when_no_model():
+    assert _build_runtime_pin(AgentConfig()) == {}
+
+
+def test_build_openclaw_config_no_runtime_pin_for_google_model():
+    cfg = AgentConfig(model="gemini-2.5-pro", provider="gemini")
+    cfg_out = _build_openclaw_config(cfg, ())
+    assert cfg_out == {}
+    assert "agentRuntime" not in json.dumps(cfg_out)
+
+
+def test_deep_merge_merges_nested_dicts_and_src_wins_on_leaves():
+    dst = {"a": {"b": 1, "c": {"d": 2}}, "e": 3}
+    src = {"a": {"c": {"d": 99, "f": 4}}, "e": 5}
+    _deep_merge(dst, src)
+    assert dst == {"a": {"b": 1, "c": {"d": 99, "f": 4}}, "e": 5}
+
+
+def test_build_openclaw_config_merges_catalog_override_and_runtime_pin(monkeypatch):
+    """A model that is both a catalog override and pinned to a runtime gets one
+    merged ``agents.defaults.models[model_id]`` entry carrying both."""
+    monkeypatch.setitem(oc_mod._PROVIDER_RUNTIME, "google", "openclaw")
+    cfg = AgentConfig(model="gemini-3.5-flash", provider="google")
+    cfg_out = _build_openclaw_config(cfg, ())
+    assert cfg_out["agents"]["defaults"]["models"] == {
+        "google/gemini-3.5-flash": {"agentRuntime": {"id": "openclaw"}}
+    }
+    assert cfg_out["models"]["providers"]["google"]["models"] == [
+        {"id": "gemini-3.5-flash", "name": "gemini-3.5-flash"}
+    ]
 
 
 def _empty_sessions_run(argv, **kwargs):
