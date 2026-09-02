@@ -282,8 +282,8 @@ def test_build_local_command_seeds_anthropic_vertex_auth_profile() -> None:
     anthropic-vertex run seeds a stored auth profile before the turn."""
     cfg = AgentConfig(model="claude-opus-5", provider="anthropic-vertex")
     cmd = _build_local_command(cfg, "prompt", "main", "/usr/local/bin/oc")
-    assert "models auth paste-api-key --provider anthropic-vertex" in cmd
-    assert "printf '%s' gcp-vertex-credentials" in cmd
+    assert "models auth paste-api-key --provider anthropic-vertex --agent main" in cmd
+    assert "printf '%s\\n' gcp-vertex-credentials" in cmd
     # Failure must be interpretable, not swallowed.
     assert "bench: seeding anthropic-vertex auth profile failed" in cmd
     # Seeded before the agent turn itself.
@@ -589,6 +589,11 @@ def test_execute_sandboxed_refuses_without_kubeconfig(
     """
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
     monkeypatch.setattr(sandbox, "current_cluster_name", lambda: None)
+    # build_agent_kubeconfig now probes the current context itself (kind vs. an
+    # exec-credential-plugin context vs. neither) rather than being skipped
+    # outright whenever current_cluster_name() is None, so it is mocked
+    # directly here to simulate the real "no kubeconfig could be built" outcome.
+    monkeypatch.setattr(sandbox, "build_agent_kubeconfig", lambda cluster, workdir: None)
 
     def fail_run(argv, **kwargs):
         raise AssertionError("must not run anything when the sandbox kubeconfig is missing")
