@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from devops_bench.agents import AGENTS, AgentConfig
+from devops_bench.agents import AGENTS, AgentConfig, sandbox
 from devops_bench.agents.capabilities import (
     AgentRules,
     AllCapabilities,
@@ -255,6 +255,86 @@ def test_execute_passes_timeout_to_subprocess(monkeypatch):
     monkeypatch.setattr(gemini_mod, "run", fake_run)
     GeminiCliAgent(AgentConfig(target="gemini", timeout_sec=15.5)).run("p")
     assert captured["timeout"] == 15.5
+
+
+def test_execute_sandboxed_wraps_argv_in_docker_run_when_cluster_context_present(
+    monkeypatch,
+) -> None:
+    """With a kubectl context present, the sandboxed run mounts a kubeconfig
+    and joins the kind network, exactly as before this change.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
+    monkeypatch.setattr(
+        sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
+    )
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini", timeout_sec=30.0)).run("p")
+
+    assert result.errors == []
+    assert captured["argv"][:2] == ["docker", "run"]
+    assert "--network" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--network") + 1] == "kind"
+    assert any(item.endswith("/kubeconfig:ro") for item in captured["argv"])
+    assert "KUBECONFIG=/kubeconfig" in captured["argv"]
+
+
+def test_execute_sandboxed_refuses_without_kubeconfig(monkeypatch) -> None:
+    """A containment control that quietly degrades is worse than none: no
+    sandbox kubeconfig must error out, never fall back to an unsandboxed run.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: None)
+    monkeypatch.setattr(sandbox, "build_agent_kubeconfig", lambda cluster, workdir: None)
+
+    def fail_run(argv, **kwargs):
+        raise AssertionError("must not run the agent itself when the sandbox kubeconfig is missing")
+
+    monkeypatch.setattr(gemini_mod, "run", fail_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    assert result.has_errors()
+    assert "BENCH_AGENT_SANDBOX" in result.errors[0]
+
+
+def test_execute_sandboxed_runs_without_kubeconfig_when_no_cluster_context(monkeypatch) -> None:
+    """A noop-deployer task never creates a cluster or a kubeconfig for this run.
+    The agent must still run inside the sandbox, just without a kubeconfig mount
+    or the kind network, and must not probe for a cluster at all.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: False)
+
+    def fail_cluster_probe(*args, **kwargs):
+        raise AssertionError("must not probe for a cluster when there is no kubectl context")
+
+    monkeypatch.setattr(sandbox, "current_cluster_name", fail_cluster_probe)
+    monkeypatch.setattr(sandbox, "build_agent_kubeconfig", fail_cluster_probe)
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini", timeout_sec=30.0)).run("p")
+
+    assert result.errors == []
+    assert captured["argv"][:2] == ["docker", "run"]
+    assert "--network" not in captured["argv"]
+    assert not any("/kubeconfig:ro" in item for item in captured["argv"])
+    assert "KUBECONFIG=/kubeconfig" not in captured["argv"]
 
 
 def test_execute_wires_extra_env_into_subprocess_call(monkeypatch):

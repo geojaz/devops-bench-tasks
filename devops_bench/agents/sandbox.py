@@ -53,6 +53,7 @@ from devops_bench.core.subprocess import run
 
 __all__ = [
     "sandbox_enabled",
+    "has_cluster_context",
     "current_cluster_name",
     "uses_exec_credential_plugin",
     "build_agent_kubeconfig",
@@ -89,6 +90,17 @@ def sandbox_enabled() -> bool:
     while tasks are still being debugged.
     """
     return os.environ.get("BENCH_AGENT_SANDBOX", "").strip().lower() in {"docker", "1", "true"}
+
+
+def has_cluster_context() -> bool:
+    """True when kubectl has a current context for this run.
+
+    Noop-deployer tasks (manifest generation only) never create a cluster or a
+    kubeconfig, so there is nothing to mount into the container; the agent
+    still runs sandboxed, it simply gets no cluster credential.
+    """
+    result = run(["kubectl", "config", "current-context"], check=False)
+    return result.returncode == 0 and bool((result.stdout or "").strip())
 
 
 def current_cluster_name() -> str | None:
@@ -345,7 +357,7 @@ def wrap_argv(
     argv: list[str],
     *,
     workspace: Path,
-    kubeconfig: Path,
+    kubeconfig: Path | None,
     image: str | None = None,
     extra_env: dict[str, str] | None = None,
     container_name: str | None = None,
@@ -372,6 +384,10 @@ def wrap_argv(
             :func:`container_guard` / :func:`sweep_stray_containers`) even
             after the local ``docker run`` client process is gone. Normally
             :func:`container_name_for_workspace` derived from ``workspace``.
+        kubeconfig: Path to the kubeconfig to mount, or ``None`` when this run
+            has no cluster credential to give the agent (a noop-deployer run:
+            see :func:`has_cluster_context`). When ``None``, no kubeconfig is
+            mounted and no ``KUBECONFIG`` env var is set inside the container.
         network: Docker network to join. Defaults to ``"kind"`` (kind's own
             network, needed to reach ``<cluster>-control-plane`` by name — see
             :func:`build_agent_kubeconfig`). Pass ``None`` for a GKE-backed
@@ -394,6 +410,8 @@ def wrap_argv(
 
     name_flags = ["--name", container_name] if container_name else []
     network_flags = ["--network", network] if network else []
+    kubeconfig_flags = ["-v", f"{kubeconfig}:/kubeconfig:ro"] if kubeconfig is not None else []
+    kubeconfig_env = ["-e", "KUBECONFIG=/kubeconfig"] if kubeconfig is not None else []
 
     return [
         # No -i. Keeping stdin open gives the agent an open, non-TTY stdin to block
@@ -408,10 +426,8 @@ def wrap_argv(
         f"{os.getuid()}:{os.getgid()}",
         "-v",
         f"{workspace}:/workspace",
-        "-v",
-        f"{kubeconfig}:/kubeconfig:ro",
-        "-e",
-        "KUBECONFIG=/kubeconfig",
+        *kubeconfig_flags,
+        *kubeconfig_env,
         "-e",
         "HOME=/workspace",
         "-w",

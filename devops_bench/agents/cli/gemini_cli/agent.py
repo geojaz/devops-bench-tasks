@@ -256,14 +256,22 @@ class GeminiCliAgent(AgentHarness):
             sandboxed = False
             container_name: str | None = None
             if sandbox.sandbox_enabled():
-                cluster = sandbox.current_cluster_name()
-                kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir)
-                if kubeconfig is None:
-                    # Refuse rather than silently running unsandboxed on the host: a
-                    # containment control that quietly degrades is worse than none.
-                    return AgentResult.errored(
-                        "BENCH_AGENT_SANDBOX is set but no sandbox kubeconfig could be "
-                        "built; refusing to fall back to an unsandboxed run"
+                cluster: str | None = None
+                kubeconfig: Path | None = None
+                if sandbox.has_cluster_context():
+                    cluster = sandbox.current_cluster_name()
+                    kubeconfig = sandbox.build_agent_kubeconfig(cluster, workdir)
+                    if kubeconfig is None:
+                        # Refuse rather than silently running unsandboxed on the host: a
+                        # containment control that quietly degrades is worse than none.
+                        return AgentResult.errored(
+                            "BENCH_AGENT_SANDBOX is set but no sandbox kubeconfig could be "
+                            "built; refusing to fall back to an unsandboxed run"
+                        )
+                else:
+                    _log.info(
+                        "no kubectl context for this run (noop deployer?); running sandboxed "
+                        "without a cluster credential"
                     )
                 container_name = sandbox.container_name_for_workspace(workdir)
                 run_argv = sandbox.wrap_argv(

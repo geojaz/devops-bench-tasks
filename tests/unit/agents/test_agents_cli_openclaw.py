@@ -391,6 +391,7 @@ def test_execute_sandboxed_wraps_argv_in_docker_run(monkeypatch, tmp_path):
     monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "some-vertex-project")
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
     monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
     monkeypatch.setattr(
         sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
@@ -454,6 +455,7 @@ def test_execute_sandboxed_copies_adc_file_into_workspace(monkeypatch, tmp_path)
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
     monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc_source))
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
     monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
     monkeypatch.setattr(
         sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
@@ -492,6 +494,7 @@ def test_execute_sandboxed_rewrites_workspace_paths_in_session_state(monkeypatch
     """
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
     monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
     monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
     monkeypatch.setattr(
         sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
@@ -527,6 +530,7 @@ def test_execute_sandboxed_refuses_without_kubeconfig(monkeypatch, tmp_path):
     sandbox kubeconfig must error out, never fall back to an unsandboxed run.
     """
     monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
     monkeypatch.setattr(sandbox, "current_cluster_name", lambda: None)
     # build_agent_kubeconfig now probes the current context itself (kind vs. an
     # exec-credential-plugin context vs. neither) rather than being skipped
@@ -543,6 +547,41 @@ def test_execute_sandboxed_refuses_without_kubeconfig(monkeypatch, tmp_path):
     result = agent.run("audit pods in default", workspace_path=tmp_path)
     assert result.has_errors()
     assert "BENCH_AGENT_SANDBOX" in result.errors[0]
+
+
+def test_execute_sandboxed_runs_without_kubeconfig_when_no_cluster_context(monkeypatch, tmp_path):
+    """A noop-deployer task never creates a cluster or a kubeconfig for this run.
+    The agent must still run inside the sandbox, just without a kubeconfig mount
+    or the kind network, and must not probe for a cluster at all.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: False)
+
+    def fail_cluster_probe(*args, **kwargs):
+        raise AssertionError("must not probe for a cluster when there is no kubectl context")
+
+    monkeypatch.setattr(sandbox, "current_cluster_name", fail_cluster_probe)
+    monkeypatch.setattr(sandbox, "build_agent_kubeconfig", fail_cluster_probe)
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        if isinstance(argv, list) and argv[:2] == ["docker", "run"]:
+            captured["argv"] = argv
+        return _make_subprocess_result(stdout="OK\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent.run("generate manifests", workspace_path=tmp_path)
+
+    assert result.errors == []
+    assert captured["argv"][:2] == ["docker", "run"]
+    assert "--network" not in captured["argv"]
+    assert not any("/kubeconfig:ro" in item for item in captured["argv"])
+    assert "KUBECONFIG=/kubeconfig" not in captured["argv"]
 
 
 def test_execute_prefers_bundle_output_over_noisy_stdout(monkeypatch, tmp_path):

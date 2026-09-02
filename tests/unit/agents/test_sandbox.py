@@ -36,6 +36,28 @@ def test_container_name_for_workspace_differs_per_workspace() -> None:
     assert a != b
 
 
+def test_has_cluster_context_true_when_current_context_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sandbox,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout="kind-my-cluster\n", stderr=""),
+    )
+    assert sandbox.has_cluster_context() is True
+
+
+def test_has_cluster_context_false_when_no_current_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sandbox,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr="error"),
+    )
+    assert sandbox.has_cluster_context() is False
+
+
 def test_current_cluster_name_returns_none_for_non_kind_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -123,6 +145,28 @@ def test_wrap_argv_omits_name_flag_when_none_given() -> None:
         image="agent-image",
     )
     assert "--name" not in argv
+
+
+def test_wrap_argv_mounts_kubeconfig_when_given() -> None:
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=Path("/tmp/ws/kubeconfig"),
+        image="agent-image",
+    )
+    assert "/tmp/ws/kubeconfig:/kubeconfig:ro" in argv
+    assert "KUBECONFIG=/kubeconfig" in argv
+
+
+def test_wrap_argv_omits_kubeconfig_mount_and_env_when_none() -> None:
+    argv = sandbox.wrap_argv(
+        ["gemini", "-p", "hi"],
+        workspace=Path("/tmp/ws"),
+        kubeconfig=None,
+        image="agent-image",
+    )
+    assert not any("/kubeconfig:ro" in item for item in argv)
+    assert "KUBECONFIG=/kubeconfig" not in argv
 
 
 def test_kill_container_invokes_docker_kill_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
