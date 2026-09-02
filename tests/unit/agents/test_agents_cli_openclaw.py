@@ -286,6 +286,26 @@ def test_build_local_command_omits_model_flag_when_no_model_configured():
     assert "models set" not in cmd
 
 
+def test_build_local_command_omits_thinking_flag_when_reasoning_effort_unset(monkeypatch):
+    monkeypatch.delenv("AGENT_REASONING_EFFORT", raising=False)
+    cmd = _build_local_command(AgentConfig(), "prompt", "main", "/usr/local/bin/oc")
+    assert "--thinking" not in cmd
+
+
+def test_build_local_command_passes_thinking_flag_between_model_and_prompt(monkeypatch):
+    monkeypatch.setenv("AGENT_REASONING_EFFORT", "high")
+    cfg = AgentConfig(model="gemini-2.5-pro", provider="gemini")
+    cmd = _build_local_command(cfg, "prompt", "main", "/usr/local/bin/oc")
+    assert "--thinking high" in cmd
+    assert cmd.index("--model") < cmd.index("--thinking high") < cmd.index(" -m ")
+
+
+def test_build_local_command_raises_for_invalid_reasoning_effort(monkeypatch):
+    monkeypatch.setenv("AGENT_REASONING_EFFORT", "turbo")
+    with pytest.raises(ValueError, match="turbo"):
+        _build_local_command(AgentConfig(), "prompt", "main", "/usr/local/bin/oc")
+
+
 def test_pick_session_key_handles_top_level_list():
     payload = json.dumps([{"key": "agent:operator:abc", "model": "x"}])
     assert _pick_session_key(payload) == "agent:operator:abc"

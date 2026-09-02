@@ -168,6 +168,11 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
     },
 }
 
+# Levels ``oc agent --thinking`` accepts.
+_THINKING_LEVELS = frozenset(
+    {"off", "minimal", "low", "medium", "high", "xhigh", "adaptive", "max"}
+)
+
 
 def _oc_model_id(config: AgentConfig) -> str:
     """Resolve the canonical ``provider/model`` id ``oc agent --model`` expects.
@@ -345,6 +350,25 @@ def _oc_model_flag(config: AgentConfig) -> str:
     return f"--model {shlex.quote(model_id)} "
 
 
+def _thinking_flag() -> str:
+    """Return ``--thinking <level> `` for ``oc agent``, or ``""`` when unset.
+
+    The reasoning-effort level is chosen per run through ``AGENT_REASONING_EFFORT``
+    rather than a config field, mirroring how the model itself is selected per run
+    via ``--model`` (see :func:`_oc_model_flag`) instead of a global setting. The
+    value maps directly onto one of openclaw's own ``oc agent --thinking`` levels.
+    """
+    raw = os.environ.get("AGENT_REASONING_EFFORT", "")
+    level = raw.strip().lower()
+    if not level:
+        return ""
+    if level not in _THINKING_LEVELS:
+        raise ValueError(
+            f"AGENT_REASONING_EFFORT={raw!r} is not one of {sorted(_THINKING_LEVELS)}"
+        )
+    return f"--thinking {shlex.quote(level)} "
+
+
 def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
     """Return whether this run must register a headless anthropic-vertex auth profile.
 
@@ -425,7 +449,8 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
         f"{auth_setup}"
         f"{quoted_oc} --log-level debug agent --local "
-        f"--agent {shlex.quote(agent_name)} {_oc_model_flag(config)}-m {shlex.quote(prompt)}"
+        f"--agent {shlex.quote(agent_name)} {_oc_model_flag(config)}{_thinking_flag()}"
+        f"-m {shlex.quote(prompt)}"
     )
 
 
@@ -503,6 +528,9 @@ class OpenClawAgent(AgentHarness):
                 env_overlay["OPENCLAW_CONFIG_PATH"] = str(config_path)
 
             command = _build_local_command(self.config, final_prompt, self.agent_name, oc_bin)
+            reasoning_effort = os.environ.get("AGENT_REASONING_EFFORT", "").strip()
+            if reasoning_effort:
+                _log.debug("oc agent --thinking %s", reasoning_effort.lower())
 
             # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker. Only
             # the agent turn itself moves into the container: state_dir/openclaw.json
