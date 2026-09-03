@@ -91,6 +91,12 @@ def test_report_carries_the_scoring_vocabulary_for_every_entry() -> None:
 
 
 def test_one_raising_entry_does_not_abort_the_rest() -> None:
+    """Entries evaluate concurrently, so which one raises is a race; either can.
+
+    The contract under test is only that one entry raising never aborts the
+    other, not which of the two concurrently-started entries hits the
+    ``RuntimeError`` first.
+    """
     entries, _ = parse_entries(_SPEC)
     ok = VerificationResult(success=True, elapsed_time=0.1, reason="fine")
     with patch(
@@ -100,9 +106,11 @@ def test_one_raising_entry_does_not_abort_the_rest() -> None:
         report = _harness()._run_verification(entries)
 
     assert len(report) == 2
-    assert report[0]["success"] is False
-    assert "cluster gone" in report[0]["reason"]
-    assert report[1]["success"] is True
+    failures = [r for r in report if r["success"] is False]
+    successes = [r for r in report if r["success"] is True]
+    assert len(failures) == 1
+    assert len(successes) == 1
+    assert "cluster gone" in failures[0]["reason"]
 
 
 def test_no_entries_yields_an_empty_report() -> None:
@@ -163,6 +171,12 @@ def test_converge_entry_is_recorded_as_budget_exhausted_once_the_total_is_gone(
 ) -> None:
     entries, errors = parse_entries(_SPEC[:1] + [{**_SPEC[0], "name": "web-ready-2"}])
     assert errors == []
+    # Entries evaluate concurrently, so pin the worker cap to 1 to force the
+    # two entries through one worker in submission order -- the same
+    # genuine-exhaustion shape a real spec hits when it has more entries
+    # than the worker cap, without a flaky race on which entry the budget
+    # ran out under.
+    monkeypatch.setattr("devops_bench.evalharness.default._MAX_PARALLEL_WORKERS", 1)
     # Above MIN_LEAF_BUDGET_SECONDS so the first entry clears the guard; the
     # sleep below then drops the remainder under it for the second entry.
     total_budget = MIN_LEAF_BUDGET_SECONDS * 1.2
@@ -200,6 +214,10 @@ def test_converge_entry_is_recorded_as_budget_exhausted_in_the_sub_second_window
     """
     entries, errors = parse_entries(_SPEC[:1] + [{**_SPEC[0], "name": "web-ready-2"}])
     assert errors == []
+    # Pin the worker cap to 1 for the same reason as the sibling test above:
+    # a deterministic submission-order race through one worker, not a flaky
+    # race on which concurrently-started entry the budget ran out under.
+    monkeypatch.setattr("devops_bench.evalharness.default._MAX_PARALLEL_WORKERS", 1)
     # Above _MIN_LEAF_BUDGET_SECONDS so the first entry clears the guard; the
     # sleep below leaves a sub-second, but strictly positive, remainder.
     monkeypatch.setattr("devops_bench.evalharness.default.VERIFICATION_TOTAL_BUDGET_SEC", 1.2)
@@ -258,6 +276,10 @@ def test_assert_entry_still_evaluates_after_the_total_budget_is_exhausted(
 ) -> None:
     entries, errors = parse_entries(_SPEC)  # [0] objective (converge), [1] safeguard (assert)
     assert errors == []
+    # Pin the worker cap to 1 so the two entries run through one worker in
+    # submission order, matching the ``called ==`` assertion below
+    # deterministically instead of racing two concurrently-started entries.
+    monkeypatch.setattr("devops_bench.evalharness.default._MAX_PARALLEL_WORKERS", 1)
     # Above _MIN_LEAF_BUDGET_SECONDS so the first (converge) entry clears the
     # guard; the sleep below then drops the remainder under it before [1].
     monkeypatch.setattr("devops_bench.evalharness.default.VERIFICATION_TOTAL_BUDGET_SEC", 1.2)
@@ -436,3 +458,87 @@ def test_run_verification_errors_a_hold_entry_with_zero_samples_rather_than_pass
     assert report[0]["success"] is False
     assert report[0]["status"] == "error"
     assert report[0]["hold_sample_count"] == 0
+
+
+# --- verification entries evaluate concurrently, not one after another ------
+
+_OBJECTIVE_HOLD_SPEC_TEMPLATE = {
+    "role": "objective",
+    "mode": "hold",
+    "hold_window_sec": 5,
+    "check": {"type": "pod_healthy", "selector": "app=web", "namespace": "shop"},
+}
+
+
+def test_several_objective_holds_run_concurrently_rather_than_serially() -> None:
+    """N independent holds should cost roughly one window, not N windows.
+
+    Serial evaluation would take at least ``len(entries) * sleep_sec``; this
+    asserts the actual wall-clock cost stays close to a single window,
+    proving the holds ran concurrently rather than queued one after another.
+    """
+    hold_specs = [
+        {**_OBJECTIVE_HOLD_SPEC_TEMPLATE, "name": f"objective-hold-{i}"} for i in range(4)
+    ]
+    entries, errors = parse_entries(hold_specs)
+    assert errors == []
+    sleep_sec = 0.3
+
+    def fake_run_hold_window(
+        entry: object, window_sec: float, *, interval_sec: float, deadline: float
+    ) -> HoldObservation:
+        time.sleep(sleep_sec)
+        return HoldObservation(sample_count=1, violated=False)
+
+    with patch(
+        "devops_bench.evalharness.default.run_hold_window", side_effect=fake_run_hold_window
+    ):
+        start = time.monotonic()
+        report = _harness()._run_verification(entries)
+        elapsed = time.monotonic() - start
+
+    assert len(report) == 4
+    assert all(r["success"] is True for r in report)
+    # A serial pass over 4 entries would take >= 4 * sleep_sec (1.2s); a
+    # concurrent pass (all 4 fit under the worker cap) takes about one
+    # window plus scheduling overhead.
+    assert elapsed < sleep_sec * 2
+
+
+def test_report_preserves_entry_order_even_when_completion_order_differs() -> None:
+    """The report's order must match the input order, not completion order."""
+    specs = [
+        {**_SPEC[0], "name": "first"},
+        {**_SPEC[0], "name": "second"},
+        {**_SPEC[0], "name": "third"},
+    ]
+    entries, errors = parse_entries(specs)
+    assert errors == []
+    # Reversed relative to input order: "first" finishes last, "third" first.
+    sleeps = {"first": 0.3, "second": 0.15, "third": 0.0}
+
+    def fake_run_entry(entry: object, timeout_sec: float = 120) -> VerificationResult:
+        time.sleep(sleeps[entry.name])  # type: ignore[attr-defined]
+        return VerificationResult(success=True, elapsed_time=0.0, reason="ok")
+
+    with patch(
+        "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
+    ):
+        report = _harness()._run_verification(entries)
+
+    assert [r["name"] for r in report] == ["first", "second", "third"]
+
+
+def test_single_entry_spec_is_unaffected_by_concurrent_evaluation() -> None:
+    """A spec with one entry behaves exactly as it did serially."""
+    entries, errors = parse_entries(_SPEC[:1])
+    assert errors == []
+    ok = VerificationResult(success=True, elapsed_time=0.05, reason="fine")
+
+    with patch("devops_bench.evalharness.default.VerifierAgent.run_entry", return_value=ok):
+        report = _harness()._run_verification(entries)
+
+    assert len(report) == 1
+    assert report[0]["name"] == "web-ready"
+    assert report[0]["success"] is True
+    assert report[0]["status"] == "pass"

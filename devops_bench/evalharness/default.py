@@ -23,6 +23,7 @@ import shutil
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,7 @@ from devops_bench.verification import (
     VerifierAgent,
     parse_entries,
 )
+from devops_bench.verification.runner import _MAX_PARALLEL_WORKERS
 
 __all__ = ["DefaultEvalHarness"]
 
@@ -527,6 +529,25 @@ class DefaultEvalHarness(Harness):
         to short-circuit an under-budget leaf as a definite "deadline
         exhausted" outcome, and this entry was never observed either way.
 
+        Entries that need real evaluation (everything except a safeguard hold,
+        which only reads an already-recorded observation) run CONCURRENTLY
+        against ``total_deadline`` rather than one after another, bounded by
+        a worker cap (:data:`~devops_bench.verification.runner._MAX_PARALLEL_WORKERS`,
+        the same cap :class:`~devops_bench.verification.runner.VerifierAgent`
+        already uses for a compound node's parallel children). Serial
+        evaluation meant one long ``hold`` entry consumed the shared budget
+        by itself, starving every entry queued behind it even though holds
+        are cheap, independent polls; a spec with one 600s hold in second
+        position out of six entries evaluated only two and errored the
+        other four as budget-exhausted, though each was a sub-second read
+        that never got a turn. Running entries concurrently lets each one
+        draw down wall-clock time only for as long as it actually takes,
+        so a slow hold no longer starves an unrelated cheap read. The
+        report is built into a list pre-sized to ``len(entries)`` and
+        filled by each entry's original index as its future completes, so
+        the returned order always matches ``entries`` regardless of which
+        one finishes first.
+
         A ``hold`` entry is never evaluated with a single ``run_entry`` call
         here, but the two roles reach their observation differently. A
         ``safeguard`` hold entry was already sampled on a background thread
@@ -557,87 +578,130 @@ class DefaultEvalHarness(Harness):
             :func:`devops_bench.verification.rollup.rollup` consumes.
         """
         agent = VerifierAgent()
-        report: list[dict[str, Any]] = []
         total_deadline = time.monotonic() + VERIFICATION_TOTAL_BUDGET_SEC
         hold_observations = hold_observations or {}
 
-        for entry in entries:
+        report: list[dict[str, Any] | None] = [None] * len(entries)
+        concurrent_indices: list[int] = []
+        for i, entry in enumerate(entries):
             if entry.resolved_mode == "hold" and entry.role == "safeguard":
-                report.append(self._hold_report_entry(entry, hold_observations.get(entry.name)))
+                # Reads an already-recorded observation; no blocking I/O, so
+                # it needs no thread of its own (see the module docstring).
+                report[i] = self._hold_report_entry(entry, hold_observations.get(entry.name))
                 continue
-            if entry.resolved_mode == "hold" and entry.role == "objective":
-                if entry.hold_window_sec is None:
-                    raise ValueError(
-                        f"objective hold entry {entry.name!r} reached verification without "
-                        "hold_window_sec set; this should have been rejected at "
-                        "spec-validation time"
-                    )
-                interval_sec = (
-                    entry.hold_poll_interval_sec
-                    if entry.hold_poll_interval_sec is not None
-                    else HOLD_POLL_INTERVAL_SEC
-                )
-                obs = run_hold_window(
-                    entry,
-                    entry.hold_window_sec,
-                    interval_sec=interval_sec,
-                    deadline=total_deadline,
-                )
-                report.append(self._hold_report_entry(entry, obs))
-                continue
+            concurrent_indices.append(i)
 
-            remaining = total_deadline - time.monotonic()
-            if entry.resolved_mode != "assert" and remaining < MIN_LEAF_BUDGET_SECONDS:
-                # Never evaluated, not a condition observed false.
-                report.append(
-                    {
-                        "name": entry.name,
-                        "role": entry.role,
-                        "severity": entry.severity,
-                        "weight": entry.weight,
-                        "mode": entry.resolved_mode,
-                        "success": False,
-                        "status": "error",
-                        "reason": "verification total budget exhausted before evaluation",
-                        "elapsed_time": 0.0,
-                        "children": [],
-                    }
-                )
-                continue
-
-            try:
-                result = agent.run_entry(entry, timeout_sec=min(timeout_sec, remaining))
-                success = result.success
-                status = result.status
-                reason = result.reason
-                elapsed = result.elapsed_time
-                children = [child.model_dump() for child in result.children]
-            except Exception as exc:  # noqa: BLE001 - one entry must not abort the rest
-                _log.exception("verification entry %r failed to evaluate", entry.name)
-                success, status, reason, elapsed, children = (
-                    False,
-                    "error",
-                    f"evaluation error: {exc}",
-                    0.0,
-                    [],
-                )
-
-            report.append(
-                {
-                    "name": entry.name,
-                    "role": entry.role,
-                    "severity": entry.severity,
-                    "weight": entry.weight,
-                    "mode": entry.resolved_mode,
-                    "success": success,
-                    "status": status,
-                    "reason": reason,
-                    "elapsed_time": elapsed,
-                    "children": children,
+        if concurrent_indices:
+            workers = min(_MAX_PARALLEL_WORKERS, len(concurrent_indices))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._evaluate_verification_entry,
+                        entries[i],
+                        agent,
+                        timeout_sec,
+                        total_deadline,
+                    ): i
+                    for i in concurrent_indices
                 }
+                for future in as_completed(futures):
+                    report[futures[future]] = future.result()
+
+        return report  # type: ignore[return-value]  # every index filled above
+
+    def _evaluate_verification_entry(
+        self,
+        entry: VerificationEntry,
+        agent: VerifierAgent,
+        timeout_sec: float,
+        total_deadline: float,
+    ) -> dict[str, Any]:
+        """Evaluate one non-safeguard-hold entry's report row.
+
+        Runs on a worker thread from :meth:`_run_verification`'s executor.
+        ``agent`` is shared across every worker: :class:`VerifierAgent`
+        carries no instance state (it is stateless by construction), and
+        ``devops_bench.verification.runner`` already shares one instance
+        across concurrent compound-node children the same way, so sharing
+        it here for concurrent top-level entries follows the same,
+        already-relied-upon contract rather than a new assumption.
+
+        Args:
+            entry: The objective-hold or leaf/assert entry to evaluate.
+            agent: The shared :class:`VerifierAgent`.
+            timeout_sec: Per-entry budget for a converging entry.
+            total_deadline: The shared monotonic deadline for this whole
+                verification pass.
+
+        Returns:
+            The entry's report row, in the same shape every branch of
+            :meth:`_run_verification` has always produced.
+        """
+        if entry.resolved_mode == "hold" and entry.role == "objective":
+            if entry.hold_window_sec is None:
+                raise ValueError(
+                    f"objective hold entry {entry.name!r} reached verification without "
+                    "hold_window_sec set; this should have been rejected at "
+                    "spec-validation time"
+                )
+            interval_sec = (
+                entry.hold_poll_interval_sec
+                if entry.hold_poll_interval_sec is not None
+                else HOLD_POLL_INTERVAL_SEC
+            )
+            obs = run_hold_window(
+                entry,
+                entry.hold_window_sec,
+                interval_sec=interval_sec,
+                deadline=total_deadline,
+            )
+            return self._hold_report_entry(entry, obs)
+
+        remaining = total_deadline - time.monotonic()
+        if entry.resolved_mode != "assert" and remaining < MIN_LEAF_BUDGET_SECONDS:
+            # Never evaluated, not a condition observed false.
+            return {
+                "name": entry.name,
+                "role": entry.role,
+                "severity": entry.severity,
+                "weight": entry.weight,
+                "mode": entry.resolved_mode,
+                "success": False,
+                "status": "error",
+                "reason": "verification total budget exhausted before evaluation",
+                "elapsed_time": 0.0,
+                "children": [],
+            }
+
+        try:
+            result = agent.run_entry(entry, timeout_sec=min(timeout_sec, remaining))
+            success = result.success
+            status = result.status
+            reason = result.reason
+            elapsed = result.elapsed_time
+            children = [child.model_dump() for child in result.children]
+        except Exception as exc:  # noqa: BLE001 - one entry must not abort the rest
+            _log.exception("verification entry %r failed to evaluate", entry.name)
+            success, status, reason, elapsed, children = (
+                False,
+                "error",
+                f"evaluation error: {exc}",
+                0.0,
+                [],
             )
 
-        return report
+        return {
+            "name": entry.name,
+            "role": entry.role,
+            "severity": entry.severity,
+            "weight": entry.weight,
+            "mode": entry.resolved_mode,
+            "success": success,
+            "status": status,
+            "reason": reason,
+            "elapsed_time": elapsed,
+            "children": children,
+        }
 
     @staticmethod
     def _hold_report_entry(entry: VerificationEntry, obs: HoldObservation | None) -> dict[str, Any]:
