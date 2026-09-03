@@ -12,7 +12,7 @@ name: "spot-rebalancing"
 # the report host path derives from cluster_name. No cloud quota.
 infrastructure:
   deployer: "tofu"
-  stack: "prebuilt/spot-rebalancing-kind"
+  stack: "prebuilt/spot-rebalancing"
   provider: "kind"
   teardown: true
 prompt: |

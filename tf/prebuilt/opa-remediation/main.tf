@@ -64,6 +64,7 @@ resource "null_resource" "setup" {
       KUBECONFIG     = pathexpand(var.kubeconfig_path)
       REPO_PATH      = pathexpand(local.repo_path)
       MANIFESTS_DIR  = "${path.module}/manifests"
+      HOME           = pathexpand("~")
     }
   }
 }

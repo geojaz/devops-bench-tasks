@@ -39,7 +39,7 @@ module "cluster" {
   project_id            = var.project_id
   cluster_name          = var.cluster_name
   location              = var.location
-  node_count            = var.infra_provider == "gcp" ? 1 : null
+  node_count            = var.infra_provider == "gcp" ? var.node_count : null
   machine_type          = var.infra_provider == "gcp" ? "e2-standard-4" : null
   kubernetes_version    = var.start_version
   node_image            = var.node_image
