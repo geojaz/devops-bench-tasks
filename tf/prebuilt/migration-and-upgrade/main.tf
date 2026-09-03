@@ -40,7 +40,7 @@ module "cluster" {
   cluster_name          = var.cluster_name
   location              = var.location
   node_count            = var.infra_provider == "gcp" ? var.node_count : null
-  machine_type          = var.infra_provider == "gcp" ? "e2-standard-4" : null
+  machine_type          = var.infra_provider == "gcp" ? var.machine_type : null
   kubernetes_version    = var.start_version
   node_image            = var.node_image
   kubeconfig_path       = var.kubeconfig_path

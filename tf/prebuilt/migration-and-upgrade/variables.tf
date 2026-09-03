@@ -29,6 +29,12 @@ variable "node_count" {
   description = "Number of worker nodes"
 }
 
+variable "machine_type" {
+  type        = string
+  description = "VM instance type"
+  default     = ""
+}
+
 variable "start_version" {
   type        = string
   description = "GKE Kubernetes version the cluster starts at (the agent upgrades to the next minor)."
