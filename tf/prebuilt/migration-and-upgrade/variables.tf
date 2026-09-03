@@ -24,6 +24,11 @@ variable "namespace" {
   default = "default"
 }
 
+variable "node_count" {
+  type        = number
+  description = "Number of worker nodes"
+}
+
 variable "start_version" {
   type        = string
   description = "GKE Kubernetes version the cluster starts at (the agent upgrades to the next minor)."

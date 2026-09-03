@@ -75,6 +75,7 @@ resource "null_resource" "setup" {
     environment = {
       KUBECONFIG    = pathexpand(var.kubeconfig_path)
       MANIFESTS_DIR = "${path.module}/manifests"
+      HOME          = pathexpand("~")
     }
   }
 }

@@ -15,7 +15,7 @@ Runs on **kind** (local, on the runner VM) — no cloud dependency, no GKE quota
 
 ## How it works
 
-- **Infrastructure** (`tf/prebuilt/spot-rebalancing-kind`) provisions a **multi-node**
+- **Infrastructure** (`tf/prebuilt/spot-rebalancing`) provisions a **multi-node**
   kind cluster (1 control-plane + 3 workers) and runs `scripts/setup.sh`, which:
   - designates node pools: one worker stays **on-demand** (untainted); the other
     two become a **Spot** pool — labeled `cloud.google.com/gke-spot=true` (the real
@@ -106,7 +106,7 @@ python -m devops_bench tasks/common/spot-rebalancing/task.yaml
 ## Verify the environment manually (optional smoke test)
 
 ```bash
-cd tf/prebuilt/spot-rebalancing-kind
+cd tf/prebuilt/spot-rebalancing
 tofu init && tofu apply -auto-approve -var cluster_name=spot-kind
 export KUBECONFIG=~/.kube/config && kubectl config use-context kind-spot-kind
 
