@@ -1169,6 +1169,25 @@ def test_model_override_anthropic_vertex_pins_transport_and_base_url(
     assert override["agents"]["defaults"]["models"] == {"anthropic-vertex/claude-opus-5": {}}
 
 
+def test_model_override_anthropic_vertex_claude_sonnet_5(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """claude-sonnet-5 is gated the same way as claude-opus-5 in the plugin's
+    dynamic catalog, so it needs the same explicit override."""
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+    override = _build_model_override(
+        AgentConfig(model="claude-sonnet-5", provider="anthropic-vertex")
+    )
+    vertex = override["models"]["providers"]["anthropic-vertex"]
+    assert vertex["api"] == "anthropic-messages"
+    assert vertex["apiKey"] == "gcp-vertex-credentials"
+    assert vertex["baseUrl"] == "https://aiplatform.googleapis.com"
+    assert vertex["models"] == [{"id": "claude-sonnet-5", "name": "claude-sonnet-5"}]
+    assert override["agents"]["defaults"]["models"] == {
+        "anthropic-vertex/claude-sonnet-5": {}
+    }
+
+
 def test_model_override_vertex_still_uses_literal_location_template() -> None:
     """Regression guard: the google-vertex entry keeps the literal ``{location}``
     template (expanded by oc itself), unaffected by the anthropic-vertex

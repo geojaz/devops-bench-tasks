@@ -148,10 +148,21 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 # that dynamic catalog at all on anthropic-vertex-provider 2026.9.1-beta.1
 # (confirmed live: absent from both the generated catalog.json and `oc models
 # list`), so for this one the explicit override is not just more robust, it is
-# the only path that works.
+# the only path that works. claude-sonnet-5 is gated the same way in the
+# plugin's buildAnthropicVertexCatalog: both entries only get emitted when a
+# region-keyed price lookup succeeds, and the entry is omitted when it fails.
+# A live sandboxed run on 2026-09-03 failed at startup with "Unknown model:
+# anthropic-vertex/claude-sonnet-5" (model-fallback reason=model_not_found),
+# so claude-sonnet-5 needs the same explicit override.
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
 _CATALOG_OVERRIDES: frozenset[str] = frozenset(
-    {"gemini-3.5-flash", "gemini-3.7-flash", "claude-fable-5", "claude-opus-5"}
+    {
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+    }
 )
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
