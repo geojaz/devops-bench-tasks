@@ -63,6 +63,7 @@ resource "null_resource" "seed_repo" {
     environment = {
       REPO_PATH     = pathexpand(local.repo_path)
       MANIFESTS_DIR = "${path.module}/manifests"
+      HOME          = pathexpand("~")
     }
   }
 }
