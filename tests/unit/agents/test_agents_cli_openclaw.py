@@ -360,6 +360,33 @@ def _bundle_writer(events_jsonl: str):
     return fake_core_run
 
 
+def _real_oc_argv(argv: list) -> list | None:
+    """Recover the plain ``oc ...`` invocation from a docker-wrapped extraction argv.
+
+    ``sandbox.wrap_argv`` may additionally wrap the command in ``sh -c ... --``
+    when the operator's uid is out of Docker's accepted range (see
+    ``sandbox._docker_user_spec``), so the exact prefix shape varies by host;
+    the literal ``"oc"`` token is what is stable. Returns ``None`` for the
+    agent turn's own docker run (a single ``/bin/bash -c <command>`` string
+    argument, never a bare ``"oc"`` list token).
+    """
+    if "oc" not in argv:
+        return None
+    return argv[argv.index("oc") :]
+
+
+def _rewrite_container_workspace(argv: list, workdir: Path) -> list:
+    """Map the container-side ``/workspace/oc-export`` arg back to its host path.
+
+    Mirrors what the real container would see mounted at ``/workspace``; the
+    fakes here never actually run docker, so the host-side fake writer needs
+    the real host path to write the bundle into.
+    """
+    container_path = "/workspace/oc-export"
+    host_path = str(workdir / "oc-export")
+    return [host_path if a == container_path else a for a in argv]
+
+
 def test_execute_happy_path_emits_canonical_trajectory(monkeypatch, tmp_path):
     """oc agent succeeds, oc sessions yields one row, export-trajectory parses cleanly.
 
@@ -402,15 +429,33 @@ def test_execute_sandboxed_wraps_argv_in_docker_run(monkeypatch, tmp_path):
 
     def fake_run(argv, **kwargs):
         # container_guard's cleanup also calls through subprocess.run (docker
-        # kill, via core.subprocess.run) on the way out -- only capture the
-        # agent turn itself (the "docker run" invocation), not that cleanup call.
+        # kill, via core.subprocess.run) on the way out, for both the agent
+        # turn's own guard and _extract_trajectory's export-container guard
+        # (patched separately below via oc_mod.run) -- only capture the agent
+        # turn itself (the "docker run" invocation via a bare argv list with
+        # shell=False), not any cleanup call.
         if isinstance(argv, list) and argv[:2] == ["docker", "run"]:
             captured["argv"] = argv
             captured["shell"] = kwargs.get("shell")
         return _make_subprocess_result(stdout="OK\n", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    # Sandboxed extraction (oc sessions / export-trajectory) is now ALSO
+    # docker-wrapped (see _real_oc_argv) and runs through oc_mod.run
+    # (agent.py's own `run` name, a separate binding from the stdlib
+    # subprocess.run patched above), never through fake_run. Unwrap the
+    # docker prefix and rewrite the container-side /workspace/oc-export path
+    # back to the real host path before handing off to the bundle writer.
+    bundle_run = _bundle_writer(SAMPLE_EVENTS)
+
+    def fake_extract_run(argv, **kwargs):
+        real_oc_argv = _real_oc_argv(argv) if isinstance(argv, list) else None
+        if real_oc_argv is not None:
+            return bundle_run(_rewrite_container_workspace(real_oc_argv, tmp_path), **kwargs)
+        return bundle_run(argv, **kwargs)
+
+    monkeypatch.setattr(oc_mod, "run", fake_extract_run)
 
     agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
     result = agent.run("audit pods in default", workspace_path=tmp_path)
@@ -470,7 +515,19 @@ def test_execute_sandboxed_copies_adc_file_into_workspace(monkeypatch, tmp_path)
         return _make_subprocess_result(stdout="OK\n", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    # See test_execute_sandboxed_wraps_argv_in_docker_run's own comment: the
+    # sandboxed export path now runs oc sessions / export-trajectory through a
+    # docker-wrapped oc_mod.run call too, unwrapped here the same way.
+    bundle_run = _bundle_writer(SAMPLE_EVENTS)
+
+    def fake_extract_run(argv, **kwargs):
+        real_oc_argv = _real_oc_argv(argv) if isinstance(argv, list) else None
+        if real_oc_argv is not None:
+            return bundle_run(_rewrite_container_workspace(real_oc_argv, tmp_path), **kwargs)
+        return bundle_run(argv, **kwargs)
+
+    monkeypatch.setattr(oc_mod, "run", fake_extract_run)
 
     agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
     result = agent.run("audit pods in default", workspace_path=tmp_path)
@@ -514,7 +571,26 @@ def test_execute_sandboxed_rewrites_workspace_paths_in_session_state(monkeypatch
         return _make_subprocess_result(stdout="OK\n", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    bundle_run = _bundle_writer(SAMPLE_EVENTS)
+
+    def fake_extract_run(argv, **kwargs):
+        real_oc_argv = _real_oc_argv(argv) if isinstance(argv, list) else None
+        if real_oc_argv is not None:
+            # The extraction call runs against this same still-/workspace-shaped
+            # state (see the "must happen only after extraction" comment in
+            # agent.py): assert the rewrite has NOT happened yet by the time
+            # `oc sessions` runs, then serve the bundle as normal.
+            sessions_json = (
+                tmp_path / "state" / "agents" / "main" / "sessions" / "sessions.json"
+            ).read_text()
+            assert "/workspace" in sessions_json, (
+                "state rewrite must not run before extraction"
+            )
+            return bundle_run(_rewrite_container_workspace(real_oc_argv, tmp_path), **kwargs)
+        return bundle_run(argv, **kwargs)
+
+    monkeypatch.setattr(oc_mod, "run", fake_extract_run)
 
     agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
     result = agent.run("audit pods in default", workspace_path=tmp_path)
@@ -572,7 +648,16 @@ def test_execute_sandboxed_runs_without_kubeconfig_when_no_cluster_context(monke
         return _make_subprocess_result(stdout="OK\n", returncode=0)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setattr(oc_mod, "run", _bundle_writer(SAMPLE_EVENTS))
+
+    bundle_run = _bundle_writer(SAMPLE_EVENTS)
+
+    def fake_extract_run(argv, **kwargs):
+        real_oc_argv = _real_oc_argv(argv) if isinstance(argv, list) else None
+        if real_oc_argv is not None:
+            return bundle_run(_rewrite_container_workspace(real_oc_argv, tmp_path), **kwargs)
+        return bundle_run(argv, **kwargs)
+
+    monkeypatch.setattr(oc_mod, "run", fake_extract_run)
 
     agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
     result = agent.run("generate manifests", workspace_path=tmp_path)
@@ -584,7 +669,226 @@ def test_execute_sandboxed_runs_without_kubeconfig_when_no_cluster_context(monke
     assert "KUBECONFIG=/kubeconfig" not in captured["argv"]
 
 
+def _install_sandboxed_agent_turn_env_capture(monkeypatch, tmp_path, captured):
+    """Common sandbox setup shared by the node-fetch-shim / vertex-env tests.
+
+    Captures the agent turn's own docker-run argv as ``captured["argv"]`` and
+    the env values baked into its ``-e KEY=VALUE`` flags as
+    ``captured["env_flags"]`` (this fork's ``wrap_argv`` bakes env values
+    straight into argv rather than passing an ``extra_env`` kwarg -- see
+    test_execute_sandboxed_wraps_argv_in_docker_run's own comment on why the
+    agent turn's own docker call goes through stdlib ``subprocess.run``, not
+    ``oc_mod.run``), and routes every other (docker-wrapped) ``oc`` call to
+    the bundle writer, mirroring the fixes already made to the sibling
+    sandboxed tests above.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
+    monkeypatch.setattr(
+        sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
+    )
+    (tmp_path / "kubeconfig").write_text("apiVersion: v1\n")
+
+    def fake_run(argv, **kwargs):
+        if isinstance(argv, list) and argv[:2] == ["docker", "run"]:
+            captured["argv"] = argv
+            captured["env_flags"] = {
+                argv[i + 1].split("=", 1)[0]: argv[i + 1].split("=", 1)[1]
+                for i, arg in enumerate(argv)
+                if arg == "-e" and i + 1 < len(argv) and "=" in argv[i + 1]
+            }
+        return _make_subprocess_result(stdout="OK\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    bundle_run = _bundle_writer(SAMPLE_EVENTS)
+
+    def fake_extract_run(argv, **kwargs):
+        real_oc_argv = _real_oc_argv(argv) if isinstance(argv, list) else None
+        if real_oc_argv is not None:
+            return bundle_run(_rewrite_container_workspace(real_oc_argv, tmp_path), **kwargs)
+        return bundle_run(argv, **kwargs)
+
+    monkeypatch.setattr(oc_mod, "run", fake_extract_run)
+
+
+def test_execute_sandboxed_writes_node_fetch_shim(monkeypatch, tmp_path):
+    """The gaxios node-fetch workaround shim is written byte-for-byte into
+    ``workdir/node-fetch-shim`` and wired up via ``NODE_OPTIONS`` in the
+    container env (see agent.py's module docstring / _write_node_fetch_shim
+    for the gaxios bug this works around).
+    """
+    captured: dict = {}
+    _install_sandboxed_agent_turn_env_capture(monkeypatch, tmp_path, captured)
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    shim_dir = tmp_path / "node-fetch-shim"
+    assert (shim_dir / "register.mjs").read_text() == (
+        "import { register } from 'node:module';\n"
+        "register('./hooks.mjs', import.meta.url);\n"
+    )
+    assert (shim_dir / "hooks.mjs").read_text() == (
+        "export async function resolve(specifier, context, next) {\n"
+        "  if (specifier === 'node-fetch') {\n"
+        "    return { url: new URL('./fetch.mjs', import.meta.url).href, shortCircuit: true };\n"
+        "  }\n"
+        "  return next(specifier, context);\n"
+        "}\n"
+    )
+    assert (shim_dir / "fetch.mjs").read_text() == (
+        "const f = (...a) => globalThis.fetch(...a);\n"
+        "export default f;\n"
+        "export const Headers = globalThis.Headers;\n"
+        "export const Request = globalThis.Request;\n"
+        "export const Response = globalThis.Response;\n"
+    )
+    assert captured["env_flags"].get("NODE_OPTIONS") == (
+        "--import=/workspace/node-fetch-shim/register.mjs"
+    )
+
+
+def test_execute_sandboxed_anthropic_vertex_sets_gcp_metadata_env(monkeypatch, tmp_path):
+    """A sandboxed anthropic-vertex run has no gcloud CLI to fall back to, so
+    the plugin's ADC path is pointed at the compute-SA metadata server
+    explicitly; the ADC marker fills in only when the ambient env has no real
+    key already.
+    """
+    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
+    captured: dict = {}
+    _install_sandboxed_agent_turn_env_capture(monkeypatch, tmp_path, captured)
+
+    agent = OpenClawAgent(
+        AgentConfig(
+            target=str(tmp_path / "oc"),
+            timeout_sec=30.0,
+            model="claude-opus-5",
+            provider="anthropic-vertex",
+        )
+    )
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    assert captured["env_flags"].get("ANTHROPIC_VERTEX_USE_GCP_METADATA") == "1"
+    assert captured["env_flags"].get("GOOGLE_CLOUD_API_KEY") == "gcp-vertex-credentials"
+
+
+def test_execute_sandboxed_anthropic_vertex_ambient_api_key_wins(monkeypatch, tmp_path):
+    """An ambient GOOGLE_CLOUD_API_KEY (a real value the operator already set)
+    must not be clobbered by the ADC marker."""
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", "sk-real-value")
+    captured: dict = {}
+    _install_sandboxed_agent_turn_env_capture(monkeypatch, tmp_path, captured)
+
+    agent = OpenClawAgent(
+        AgentConfig(
+            target=str(tmp_path / "oc"),
+            timeout_sec=30.0,
+            model="claude-opus-5",
+            provider="anthropic-vertex",
+        )
+    )
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    assert captured["env_flags"].get("GOOGLE_CLOUD_API_KEY") == "sk-real-value"
+    assert captured["env_flags"].get("ANTHROPIC_VERTEX_USE_GCP_METADATA") == "1"
+
+
+def test_execute_sandboxed_non_vertex_provider_omits_vertex_env(monkeypatch, tmp_path):
+    """A sandboxed openai-provider run gets the node-fetch shim's NODE_OPTIONS
+    but neither of the anthropic-vertex-only env vars."""
+    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
+    captured: dict = {}
+    _install_sandboxed_agent_turn_env_capture(monkeypatch, tmp_path, captured)
+
+    agent = OpenClawAgent(
+        AgentConfig(
+            target=str(tmp_path / "oc"),
+            timeout_sec=30.0,
+            model="gpt-5",
+            provider="openai",
+            api_key="sk-openai",
+        )
+    )
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    assert captured["env_flags"].get("NODE_OPTIONS") == (
+        "--import=/workspace/node-fetch-shim/register.mjs"
+    )
+    assert "ANTHROPIC_VERTEX_USE_GCP_METADATA" not in captured["env_flags"]
+    assert "GOOGLE_CLOUD_API_KEY" not in captured["env_flags"]
+
+
+def test_execute_sandboxed_extraction_runs_in_container(monkeypatch, tmp_path):
+    """Sandboxed mode has no host ``oc`` binary at all: the sessions and
+    export-trajectory calls must be docker-wrapped, pass
+    ``--workspace /workspace/oc-export``, and the bundle is read back from the
+    host path ``<workdir>/oc-export``. No bare (non-docker-wrapped) ``oc``
+    argv may ever be executed.
+    """
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_AGENT_IMAGE", "devops-bench/agent-sandbox:dev")
+    monkeypatch.setattr(sandbox, "has_cluster_context", lambda: True)
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "eval")
+    monkeypatch.setattr(
+        sandbox, "build_agent_kubeconfig", lambda cluster, dest: dest / "kubeconfig"
+    )
+    (tmp_path / "kubeconfig").write_text("apiVersion: v1\n")
+
+    calls: list[str] = []
+    sessions_payload = json.dumps([{"key": "agent:main:test", "model": "google/gemini-2.5-pro"}])
+
+    def fake_run(argv, **kwargs):
+        # The agent turn's own docker run goes through stdlib subprocess.run
+        # on this fork (see test_execute_sandboxed_wraps_argv_in_docker_run);
+        # extraction (checked below via oc_mod.run) is the thing under test
+        # here, so this fake only needs to record that the turn happened.
+        if isinstance(argv, list) and argv[:2] == ["docker", "run"]:
+            calls.append("agent-turn")
+        return _make_subprocess_result(stdout="OK\n", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    def fake_extract_run(argv, **kwargs):
+        if not (isinstance(argv, list) and argv[:2] == ["docker", "run"]):
+            raise AssertionError(f"a bare (non-docker) argv must never run: {argv}")
+
+        real_oc_argv = _real_oc_argv(argv)
+        if real_oc_argv is None:
+            raise AssertionError(f"unexpected docker-wrapped extraction call: {argv}")
+
+        if "export-trajectory" in real_oc_argv:
+            calls.append("export-trajectory")
+            assert "--workspace" in real_oc_argv
+            ws_idx = real_oc_argv.index("--workspace") + 1
+            assert real_oc_argv[ws_idx] == "/workspace/oc-export"
+            host_ws = tmp_path / "oc-export"
+            export_root = host_ws / ".openclaw" / "trajectory-exports" / "openclaw-trajectory-x"
+            export_root.mkdir(parents=True, exist_ok=True)
+            (export_root / "events.jsonl").write_text(SAMPLE_EVENTS, encoding="utf-8")
+            return _make_subprocess_result(stdout="exported", returncode=0)
+
+        calls.append("sessions")
+        return _make_subprocess_result(stdout=sessions_payload, returncode=0)
+
+    monkeypatch.setattr(oc_mod, "run", fake_extract_run)
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent.run("audit pods in default", workspace_path=tmp_path)
+
+    assert result.errors == []
+    assert calls == ["agent-turn", "sessions", "export-trajectory"]
+    assert len(result.trajectory) == 2
+
+
 def test_execute_prefers_bundle_output_over_noisy_stdout(monkeypatch, tmp_path):
+
     """The agent's final answer (events.jsonl assistantTexts) must win over
     `oc --log-level debug` noise — otherwise the judge grades debug spew.
     """

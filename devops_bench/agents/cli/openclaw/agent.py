@@ -197,6 +197,63 @@ _SUBAGENT_TOOL_DENY: tuple[str, ...] = (
     "subagents",
 )
 
+# Per-run layout of the node-fetch->native-fetch ESM loader shim (see
+# :func:`_write_node_fetch_shim`), written under the run's own workdir so it
+# is visible inside the sandboxed container at ``/workspace/node-fetch-shim``.
+_NODE_FETCH_SHIM_DIRNAME = "node-fetch-shim"
+
+_NODE_FETCH_REGISTER_MJS = (
+    "import { register } from 'node:module';\n"
+    "register('./hooks.mjs', import.meta.url);\n"
+)
+
+_NODE_FETCH_HOOKS_MJS = (
+    "export async function resolve(specifier, context, next) {\n"
+    "  if (specifier === 'node-fetch') {\n"
+    "    return { url: new URL('./fetch.mjs', import.meta.url).href, shortCircuit: true };\n"
+    "  }\n"
+    "  return next(specifier, context);\n"
+    "}\n"
+)
+
+_NODE_FETCH_FETCH_MJS = (
+    "const f = (...a) => globalThis.fetch(...a);\n"
+    "export default f;\n"
+    "export const Headers = globalThis.Headers;\n"
+    "export const Request = globalThis.Request;\n"
+    "export const Response = globalThis.Response;\n"
+)
+
+
+def _write_node_fetch_shim(workdir: Path) -> None:
+    """Write the node-fetch->native-fetch ESM loader shim into ``workdir``.
+
+    Works around a gaxios (7.3.1, google-auth-library's HTTP layer) bug inside
+    the agent-sandbox image: with no ``window`` global, gaxios does
+    ``(await import('node-fetch')).default`` to reach the compute-SA metadata
+    server, and that dynamic import throws ("Cannot convert undefined or null
+    to object") because node-fetch is not installed in the image. A Node
+    module-customization hook (registered via ``NODE_OPTIONS``, see the
+    sandboxed branch of :meth:`OpenClawAgent._execute`) intercepts only the
+    bare ``node-fetch`` specifier and resolves it to a tiny shim built on
+    Node's native ``fetch``; every other import passes through unchanged.
+
+    Files are written world-readable (0o644, dir 0o755): the container's own
+    ``--user`` may not match whichever uid this (possibly privileged) process
+    runs as, so permission bits do the work instead of a chown.
+    """
+    shim_dir = workdir / _NODE_FETCH_SHIM_DIRNAME
+    shim_dir.mkdir(exist_ok=True)
+    shim_dir.chmod(0o755)
+    for name, content in (
+        ("register.mjs", _NODE_FETCH_REGISTER_MJS),
+        ("hooks.mjs", _NODE_FETCH_HOOKS_MJS),
+        ("fetch.mjs", _NODE_FETCH_FETCH_MJS),
+    ):
+        path = shim_dir / name
+        path.write_text(content)
+        path.chmod(0o644)
+
 
 def _build_tool_policy() -> dict:
     return {"tools": {"deny": list(_SUBAGENT_TOOL_DENY)}}
@@ -437,6 +494,19 @@ def _thinking_flag() -> str:
     return f"--thinking {shlex.quote(level)} "
 
 
+def _oc_provider_or_none(config: AgentConfig) -> str | None:
+    """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
+
+    Shared by :func:`_needs_anthropic_vertex_auth_profile` and the sandboxed
+    anthropic-vertex env passthrough in :meth:`OpenClawAgent._execute`, so the
+    "is this run on anthropic-vertex" check has exactly one implementation.
+    """
+    try:
+        return resolve_provider(config.provider).oc_provider
+    except ConfigError:
+        return None
+
+
 def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
     """Return whether this run must register a headless anthropic-vertex auth profile.
 
@@ -458,11 +528,7 @@ def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
     anthropic-vertex turn (see :func:`_build_local_command`). It is a no-op
     correctness-wise for a run that already carries an explicit API key.
     """
-    try:
-        provider = resolve_provider(config.provider).oc_provider
-    except ConfigError:
-        return False
-    return provider == "anthropic-vertex" and not config.api_key
+    return _oc_provider_or_none(config) == "anthropic-vertex" and not config.api_key
 
 
 def _prepend_rules(rules_text: str, prompt: str) -> str:
@@ -600,12 +666,12 @@ class OpenClawAgent(AgentHarness):
             if reasoning_effort:
                 _log.debug("oc agent --thinking %s", reasoning_effort.lower())
 
-            # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker. Only
-            # the agent turn itself moves into the container: state_dir/openclaw.json
-            # above are already written into workdir (mounted in as /workspace), and
-            # _extract_trajectory below reads that same state back on the host, so it
-            # needs no sandboxing of its own (it is a harness-side read of the turn's
-            # own output, not new untrusted execution).
+            # Containerised execution, opt-in via BENCH_AGENT_SANDBOX=docker.
+            # state_dir/openclaw.json above are already written into workdir
+            # (mounted in as /workspace); _extract_trajectory below also runs its
+            # session/export-trajectory calls inside this same sandbox image when
+            # sandboxed (the host has no `oc` binary at all in that case), reading
+            # the container's own /workspace view of the state the turn just wrote.
             sandboxed = False
             container_name: str | None = None
             run_argv: list[str] | None = None
@@ -628,6 +694,7 @@ class OpenClawAgent(AgentHarness):
                         "without a cluster credential"
                     )
                 container_name = sandbox.container_name_for_workspace(workdir)
+                _write_node_fetch_shim(workdir)
                 # A container never inherits the host shell's environment (unlike
                 # the non-sandboxed branch below, which merges env_overlay into
                 # os.environ) -- only what wrap_argv bakes in as -e flags exists
@@ -677,6 +744,25 @@ class OpenClawAgent(AgentHarness):
                     adc_copy.write_bytes(Path(adc_host_path).read_bytes())
                     adc_copy.chmod(0o600)
                     vertex_passthrough["GOOGLE_APPLICATION_CREDENTIALS"] = str(adc_copy)
+                # Load the node-fetch->native-fetch shim before anything else runs
+                # in the container (see _write_node_fetch_shim's own docstring for
+                # the gaxios bug this works around). The literal /workspace path is
+                # deliberate: this value starts with "--import=", not a bare
+                # workdir-subpath, so the generic rewrite below would not catch it
+                # even though the shim files themselves do live under workdir.
+                vertex_passthrough["NODE_OPTIONS"] = (
+                    "--import=/workspace/node-fetch-shim/register.mjs"
+                )
+                if _oc_provider_or_none(self.config) == "anthropic-vertex":
+                    # Mirrors _needs_anthropic_vertex_auth_profile's own auth-profile
+                    # seeding: the sandbox has no gcloud CLI to fall back to, so the
+                    # plugin's ADC path is pointed at the compute-SA metadata server
+                    # explicitly. GOOGLE_CLOUD_API_KEY only gets the ADC marker when
+                    # the ambient env doesn't already carry a real value (the
+                    # passthrough above keeps that one's precedence).
+                    vertex_passthrough["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
+                    if "GOOGLE_CLOUD_API_KEY" not in os.environ:
+                        vertex_passthrough["GOOGLE_CLOUD_API_KEY"] = "gcp-vertex-credentials"
                 # OPENCLAW_STATE_DIR/OPENCLAW_CONFIG_PATH above are host-absolute
                 # paths under workdir (e.g. /tmp/oc-run-xxx/state), but wrap_argv
                 # mounts workdir at /workspace inside the container -- passed
@@ -751,21 +837,6 @@ class OpenClawAgent(AgentHarness):
             except OSError as exc:
                 return AgentResult.errored(f"oc binary unavailable: {exc}")
 
-            if sandboxed:
-                # oc persists sessions.json / *.trajectory-path.json with the
-                # /workspace-relative paths it saw from inside the container
-                # (sessionFile/runtimeFile fields). _extract_trajectory below runs
-                # on the HOST against this same directory (state_dir is workdir's
-                # own subpath, unaffected by the container boundary -- only the
-                # env values passed *into* the container needed rewriting above),
-                # so a stored "/workspace/..." path resolves to nothing there and
-                # oc fails with "Session file not found". Rewrite it back before
-                # the host-side lookup runs.
-                for state_file in state_dir.rglob("*.json"):
-                    text = state_file.read_text()
-                    if "/workspace" in text:
-                        state_file.write_text(text.replace("/workspace", str(workdir)))
-
             stdout_text = _strip_ansi(completed.stdout or "")
             errors: list[str] = []
             metadata: dict = {}
@@ -775,10 +846,36 @@ class OpenClawAgent(AgentHarness):
                 errors.append(f"oc agent exited {completed.returncode}: {stderr or '<no stderr>'}")
                 metadata["returncode"] = completed.returncode
 
-            trajectory, tokens, bundle_output, export_errors = self._extract_trajectory(
-                oc_bin, env_overlay
-            )
+            if sandboxed:
+                trajectory, tokens, bundle_output, export_errors = self._extract_trajectory(
+                    oc_bin,
+                    env_overlay,
+                    sandboxed=True,
+                    workdir=workdir,
+                    container_env=container_env_overlay,
+                )
+            else:
+                trajectory, tokens, bundle_output, export_errors = self._extract_trajectory(
+                    oc_bin, env_overlay
+                )
             errors.extend(export_errors)
+
+            if sandboxed:
+                # oc persists sessions.json / *.trajectory-path.json with the
+                # /workspace-relative paths it saw from inside the container
+                # (sessionFile/runtimeFile fields). _extract_trajectory above now
+                # ALSO runs its own oc sessions/export-trajectory calls inside this
+                # same container (see its sandboxed branch), against that same
+                # /workspace view, so this rewrite must happen only after that
+                # extraction returns -- rewriting first would break the
+                # container-side session lookup that call just performed. It is
+                # still done host-side afterward so any later (host) inspection of
+                # the archived state files is readable without the container's
+                # path mapping.
+                for state_file in state_dir.rglob("*.json"):
+                    text = state_file.read_text()
+                    if "/workspace" in text:
+                        state_file.write_text(text.replace("/workspace", str(workdir)))
 
         # Bundle text is clean; bash stdout carries debug noise — fall back only if empty.
         output = bundle_output if bundle_output else stdout_text
@@ -792,13 +889,26 @@ class OpenClawAgent(AgentHarness):
         )
 
     def _extract_trajectory(
-        self, oc_bin: str, env_overlay: dict[str, str]
+        self,
+        oc_bin: str,
+        env_overlay: dict[str, str],
+        *,
+        sandboxed: bool = False,
+        workdir: Path | None = None,
+        container_env: dict[str, str] | None = None,
     ) -> tuple[list[dict], dict, str, list[str]]:
         """Run ``oc sessions`` + ``export-trajectory`` and parse the bundle.
 
         ``env_overlay`` carries ``OPENCLAW_STATE_DIR`` (and ``OPENCLAW_CONFIG_PATH``
         when MCP is configured) so the session commands read from the same
         isolated state the agent turn wrote to.
+
+        When ``sandboxed`` is True, the host has no ``oc`` binary at all (the
+        agent turn itself ran inside the sandbox image), so both commands run
+        there too via ``sandbox.wrap_argv``, against the container's own
+        ``/workspace`` view of the state the turn just wrote. ``workdir`` and
+        ``container_env`` are required in that case; ``oc_bin`` is only used on
+        the unsandboxed path (inside the image ``oc`` is on ``PATH``).
 
         Returns:
             A ``(trajectory, tokens, output_text, errors)`` tuple. ``output_text``
@@ -807,72 +917,168 @@ class OpenClawAgent(AgentHarness):
             caller falls back to the ansi-stripped subprocess stdout when empty.
         """
         errors: list[str] = []
-        # The agent turn sources nvm inside a bash command, but these extraction
-        # calls run oc as a direct argv subprocess (no shell), so on nvm-managed
-        # hosts Node isn't on PATH -> `oc sessions` exits 127 and the trajectory
-        # is silently emptied. Make Node discoverable for the direct calls.
-        env_overlay = _ensure_node_on_path(env_overlay)
-        try:
-            sessions = run(
-                [oc_bin, "sessions", "--agent", self.agent_name, "--json"],
-                check=False,
-                timeout=self.config.timeout_sec,
-                extra_env=env_overlay,
-            )
-        except SubprocessError as exc:
-            errors.append(f"oc sessions failed: {exc}")
-            return [], {}, "", errors
-        except OSError as exc:
-            errors.append(f"oc sessions: binary unavailable: {exc}")
-            return [], {}, "", errors
+        if not sandboxed:
+            # The agent turn sources nvm inside a bash command, but these
+            # extraction calls run oc as a direct argv subprocess (no shell), so
+            # on nvm-managed hosts Node isn't on PATH -> `oc sessions` exits 127
+            # and the trajectory is silently emptied. Make Node discoverable for
+            # the direct calls. Not needed in the sandbox image, which installs
+            # Node/oc system-wide.
+            env_overlay = _ensure_node_on_path(env_overlay)
 
-        if sessions.returncode != 0:
-            stderr = (sessions.stderr or "").strip()
-            errors.append(f"oc sessions exited {sessions.returncode}: {stderr or '<no stderr>'}")
-            return [], {}, "", errors
+        export_container_name: str | None = None
+        guard: contextlib.AbstractContextManager = contextlib.nullcontext()
+        if sandboxed:
+            assert workdir is not None and container_env is not None
+            # Distinct from the agent turn's own container name so a stray
+            # extraction container is never mistaken for (or races) the turn's.
+            export_container_name = sandbox.container_name_for_workspace(workdir) + "-export"
+            guard = sandbox.container_guard(export_container_name)
 
-        key = _pick_session_key(sessions.stdout or "")
-        if key is None:
-            errors.append("oc sessions returned no session key")
-            return [], {}, "", errors
+        with guard:
+            if sandboxed:
+                sessions_argv = sandbox.wrap_argv(
+                    ["oc", "sessions", "--agent", self.agent_name, "--json"],
+                    workspace=workdir,
+                    kubeconfig=None,
+                    extra_env=container_env,
+                    container_name=export_container_name,
+                    network=None,
+                )
+                sessions_extra_env = container_env
+            else:
+                sessions_argv = [oc_bin, "sessions", "--agent", self.agent_name, "--json"]
+                sessions_extra_env = env_overlay
 
-        with tempfile.TemporaryDirectory(prefix="oc-export-") as tmpdir:
-            workspace = Path(tmpdir)
             try:
-                export = run(
+                # Stays on the privileged run(), not run_as_agent, pending a
+                # decision: this reads the just-completed session back off oc's
+                # own state dir, not the task's answer key, so it is a lower-risk
+                # privileged call than the agent turn itself.
+                sessions = run(
+                    sessions_argv,
+                    check=False,
+                    timeout=self.config.timeout_sec,
+                    extra_env=sessions_extra_env,
+                    cwd=str(workdir) if sandboxed else None,
+                )
+            except SubprocessError as exc:
+                errors.append(f"oc sessions failed: {exc}")
+                return [], {}, "", errors
+            except OSError as exc:
+                errors.append(f"oc sessions: binary unavailable: {exc}")
+                return [], {}, "", errors
+
+            if sessions.returncode != 0:
+                stderr = (sessions.stderr or "").strip()
+                errors.append(
+                    f"oc sessions exited {sessions.returncode}: {stderr or '<no stderr>'}"
+                )
+                return [], {}, "", errors
+
+            key = _pick_session_key(sessions.stdout or "")
+            if key is None:
+                errors.append("oc sessions returned no session key")
+                return [], {}, "", errors
+
+            if sandboxed:
+                # The export workspace must live under the mount so the host can
+                # read the bundle back afterward -- the container only ever sees
+                # paths under /workspace.
+                export_workspace = workdir / "oc-export"
+                export_workspace.mkdir(exist_ok=True)
+                export_argv = sandbox.wrap_argv(
                     [
-                        oc_bin,
+                        "oc",
                         "sessions",
                         "export-trajectory",
                         "--session-key",
                         key,
                         "--workspace",
-                        str(workspace),
+                        "/workspace/oc-export",
                         "--json",
                     ],
-                    check=False,
-                    timeout=self.config.timeout_sec,
-                    extra_env=env_overlay,
+                    workspace=workdir,
+                    kubeconfig=None,
+                    extra_env=container_env,
+                    container_name=export_container_name,
+                    network=None,
                 )
-            except SubprocessError as exc:
-                errors.append(f"oc export-trajectory failed: {exc}")
-                return [], {}, "", errors
-            except OSError as exc:
-                errors.append(f"oc export-trajectory: binary unavailable: {exc}")
-                return [], {}, "", errors
+                try:
+                    export = run(
+                        export_argv,
+                        check=False,
+                        timeout=self.config.timeout_sec,
+                        extra_env=container_env,
+                        cwd=str(workdir),
+                    )
+                except SubprocessError as exc:
+                    errors.append(f"oc export-trajectory failed: {exc}")
+                    return [], {}, "", errors
+                except OSError as exc:
+                    errors.append(f"oc export-trajectory: binary unavailable: {exc}")
+                    return [], {}, "", errors
 
-            if export.returncode != 0:
-                stderr = (export.stderr or "").strip()
-                errors.append(
-                    f"oc export-trajectory exited {export.returncode}: {stderr or '<no stderr>'}"
+                if export.returncode != 0:
+                    stderr = (export.stderr or "").strip()
+                    errors.append(
+                        f"oc export-trajectory exited {export.returncode}: "
+                        f"{stderr or '<no stderr>'}"
+                    )
+                    return [], {}, "", errors
+
+                events_text, read_errors = _read_export_bundle(export_workspace)
+                errors.extend(read_errors)
+                if not events_text:
+                    return [], {}, "", errors
+
+                trajectory, tokens, output_text, parse_errors = parse_trajectory_export(
+                    events_text
                 )
-                return [], {}, "", errors
+                errors.extend(parse_errors)
+                return trajectory, tokens, output_text, errors
 
-            events_text, read_errors = _read_export_bundle(workspace)
-            errors.extend(read_errors)
-            if not events_text:
-                return [], {}, "", errors
+            with tempfile.TemporaryDirectory(prefix="oc-export-") as tmpdir:
+                workspace = Path(tmpdir)
+                try:
+                    # Stays on the privileged run(); see the sessions call above.
+                    export = run(
+                        [
+                            oc_bin,
+                            "sessions",
+                            "export-trajectory",
+                            "--session-key",
+                            key,
+                            "--workspace",
+                            str(workspace),
+                            "--json",
+                        ],
+                        check=False,
+                        timeout=self.config.timeout_sec,
+                        extra_env=env_overlay,
+                    )
+                except SubprocessError as exc:
+                    errors.append(f"oc export-trajectory failed: {exc}")
+                    return [], {}, "", errors
+                except OSError as exc:
+                    errors.append(f"oc export-trajectory: binary unavailable: {exc}")
+                    return [], {}, "", errors
 
-            trajectory, tokens, output_text, parse_errors = parse_trajectory_export(events_text)
-            errors.extend(parse_errors)
-            return trajectory, tokens, output_text, errors
+                if export.returncode != 0:
+                    stderr = (export.stderr or "").strip()
+                    errors.append(
+                        f"oc export-trajectory exited {export.returncode}: "
+                        f"{stderr or '<no stderr>'}"
+                    )
+                    return [], {}, "", errors
+
+                events_text, read_errors = _read_export_bundle(workspace)
+                errors.extend(read_errors)
+                if not events_text:
+                    return [], {}, "", errors
+
+                trajectory, tokens, output_text, parse_errors = parse_trajectory_export(
+                    events_text
+                )
+                errors.extend(parse_errors)
+                return trajectory, tokens, output_text, errors
