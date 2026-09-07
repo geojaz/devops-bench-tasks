@@ -186,6 +186,29 @@ def test_build_env_unknown_provider_raises_even_when_keyless():
         _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertyx"))
 
 
+def test_build_env_vertex_sets_use_vertexai_selector():
+    # ADC alone does not tell the gemini binary which backend to select; the
+    # sandboxed run only gets what this overlay carries, so the selector must
+    # be part of it.
+    env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
+    assert env["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+
+
+def test_build_env_key_based_provider_omits_use_vertexai_selector():
+    # Setting the selector unconditionally would break a legitimate
+    # GEMINI_API_KEY run by routing it at the Vertex backend.
+    env = _build_env(AgentConfig(model="gemini-2.5-pro", api_key="abc", provider="google"))
+    assert "GOOGLE_GENAI_USE_VERTEXAI" not in env
+
+
+def test_build_env_vertex_threads_project_and_location_from_ambient_env(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "ehole-benchmark-temp-z8s8")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+    env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
+    assert env["GOOGLE_CLOUD_PROJECT"] == "ehole-benchmark-temp-z8s8"
+    assert env["GOOGLE_CLOUD_LOCATION"] == "global"
+
+
 def test_gemini_agent_registered_under_canonical_key():
     assert AGENTS.get("gemini") is GeminiCliAgent
 

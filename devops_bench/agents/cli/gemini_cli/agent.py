@@ -145,7 +145,11 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     ``config.model`` onto ``GEMINI_MODEL``. OTLP telemetry exporters are disabled
     so they don't hang on broken endpoints. The model is never hardcoded; it
     flows from ``config.model``. A keyless backend (e.g. Vertex/ADC) writes no
-    key.
+    key, but a Vertex backend still needs ``GOOGLE_GENAI_USE_VERTEXAI`` set
+    explicitly: ADC alone authenticates the caller, it does not tell the
+    ``gemini`` binary which backend to select, and the sandboxed run (see
+    ``agents/sandbox.py``) never inherits the ambient env where an operator
+    may have exported it, so it must be part of this overlay.
 
     Args:
         config: Resolved :class:`AgentConfig` for this run.
@@ -167,6 +171,17 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         "OTEL_LOGS_EXPORTER": "none",
         "OTEL_SDK_DISABLED": "true",
     }
+    if spec.backend == "vertex":
+        # The gemini binary requires this selector even under ADC: it decides
+        # which backend to talk to, which ADC alone does not communicate. The
+        # sandboxed run gets only what this overlay carries (see
+        # sandbox.wrap_argv), not the ambient env, so an operator's exported
+        # GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION must be threaded through
+        # explicitly too, when set.
+        overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+        for var in ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"):
+            if var in os.environ:
+                overlay[var] = os.environ[var]
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
