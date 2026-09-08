@@ -139,7 +139,7 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 # the only path that works.
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
 _CATALOG_OVERRIDES: frozenset[str] = frozenset(
-    {"gemini-3.5-flash", "gemini-3.7-flash", "claude-fable-5", "claude-opus-5"}
+    {"gemini-3.5-flash", "gemini-3.7-flash", "claude-fable-5", "claude-opus-5", "claude-sonnet-5"}
 )
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
@@ -429,7 +429,8 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
 
     The key is routed onto the provider's API-key env var(s) from the shared
     contract (:func:`~devops_bench.core.model_providers.resolve_provider`). When
-    ``config.api_key`` is unset the overlay carries no key — the **Vertex / ADC**
+    ``config.api_key`` is unset, native provider key variables are preserved from
+    the ambient environment so sandboxed runs can authenticate. For the **Vertex / ADC**
     path: ``google-vertex`` resolves credentials from the metadata-server
     Application Default Credentials at request time (the matrix exports the
     ``GOOGLE_CLOUD_API_KEY=gcp-vertex-credentials`` ADC marker), and the contract
@@ -450,7 +451,9 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     # Resolve unconditionally so an unknown provider fails loud even on a keyless
     # (Vertex/ADC) run, not only when a key happens to be set.
     spec = resolve_provider(config.provider)
-    overlay: dict[str, str] = {}
+    # Docker does not inherit the host environment. Preserve only this
+    # provider's native credential variables; explicit config still wins.
+    overlay = {var: os.environ[var] for var in spec.api_key_envs if os.environ.get(var)}
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key

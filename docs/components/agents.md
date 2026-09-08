@@ -49,6 +49,12 @@ binary's provider-specific env var(s) and pass the model through: the Gemini CLI
 gets `GEMINI_MODEL`, and openclaw gets a `--model provider/id` flag. Either way,
 the model is a runtime input, never baked into the harness.
 
+OpenClaw also forwards the selected provider's native key variables (for example,
+`OPENAI_API_KEY`) into its sandbox. `AGENT_API_KEY` overrides those ambient keys;
+explicit `extra_env` values take final precedence. Other providers' credentials
+are not forwarded. Models missing from OpenClaw's catalog, including
+`anthropic-vertex/claude-sonnet-5`, receive an isolated per-run catalog entry.
+
 For everything about providers, model ids, and how `get_model` resolves them, see
 [Model providers](./model_providers.md).
 

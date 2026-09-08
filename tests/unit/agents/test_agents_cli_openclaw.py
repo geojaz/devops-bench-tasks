@@ -1550,3 +1550,25 @@ def test_execute_cleans_up_temp_working_dir_after_run(monkeypatch, tmp_path):
     OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
     assert captured["cwd"] is not None
     assert not os.path.exists(captured["cwd"])
+
+
+def test_build_env_preserves_native_provider_key_for_sandbox(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "native-openai-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-secret")
+    assert _build_env(AgentConfig(provider="openai")) == {"OPENAI_API_KEY": "native-openai-key"}
+    assert _build_env(AgentConfig(provider="openai", api_key="explicit")) == {
+        "OPENAI_API_KEY": "explicit"
+    }
+    assert _build_env(AgentConfig(provider="openai", extra_env={"OPENAI_API_KEY": "extra"})) == {
+        "OPENAI_API_KEY": "extra"
+    }
+
+
+def test_model_override_registers_sonnet_five_on_vertex():
+    override = _build_model_override(
+        AgentConfig(model="claude-sonnet-5", provider="anthropic-vertex")
+    )
+    vertex = override["models"]["providers"]["anthropic-vertex"]
+    assert vertex["api"] == "anthropic-messages"
+    assert vertex["apiKey"] == "gcp-vertex-credentials"
+    assert vertex["models"] == [{"id": "claude-sonnet-5", "name": "claude-sonnet-5"}]
