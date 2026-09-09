@@ -42,6 +42,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import tempfile
@@ -446,7 +447,10 @@ def container_name_for_workspace(workspace: Path) -> str:
     so a reaper can find and kill a stray container purely from its name,
     without threading a separate run id through the agent harness.
     """
-    return f"{_CONTAINER_NAME_PREFIX}{workspace.name}"
+    owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
+    if owner and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
+        raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
+    return f"{_CONTAINER_NAME_PREFIX}{owner + '-' if owner else ''}{workspace.name}"
 
 
 def kill_container(name: str) -> None:
@@ -484,27 +488,24 @@ def container_guard(name: str) -> Iterator[None]:
 
 
 def sweep_stray_containers() -> None:
-    """Best-effort reap of containers this harness left running from a prior run.
+    """Reap only the explicitly selected attempt's leftovers.
 
-    Intended to run once at harness start (before any run's own container
-    exists) so a container orphaned by a prior crash or a killed harness
-    process gets cleaned up before it burns any more quota. Matches
-    exclusively on :data:`_CONTAINER_NAME_PREFIX`, this harness's own naming
-    convention, so it can never reap a container it did not itself create.
+    A shared name prefix is not proof that another process has exited. Legacy
+    unscoped containers require explicit operator recovery; never sweep them here.
+    The owner ID must be unique per attempt and must not be reused concurrently.
     """
-    listed = run(
-        ["docker", "ps", "-q", "--filter", f"name=^{_CONTAINER_NAME_PREFIX}"],
-        check=False,
-    )
+    owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
+    if not owner:
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
+        raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
+    prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-"
+    listed = run(["docker", "ps", "--format", "{{.Names}}"], check=False)
     if listed.returncode != 0:
         return
-    stray_ids = [line.strip() for line in (listed.stdout or "").splitlines() if line.strip()]
-    for container_id in stray_ids:
-        result = run(["docker", "kill", container_id], check=False)
-        if result.returncode == 0:
-            _log.warning(
-                "reaped stray sandbox container %s left running from a prior run", container_id
-            )
+    for name in (listed.stdout or "").splitlines():
+        if name.startswith(prefix):
+            kill_container(name)
 
 
 def make_workspace() -> Path:

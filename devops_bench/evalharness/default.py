@@ -873,15 +873,10 @@ class DefaultEvalHarness(Harness):
         return detailed_results
 
     def _sweep_stray_sandbox_containers(self) -> None:
-        """Reap any sandboxed agent container left running from a prior run.
+        """Reap leftovers only for an explicitly scoped attempt.
 
-        Best-effort and a no-op unless ``BENCH_AGENT_SANDBOX`` is set: a
-        container the harness starts is normally cleaned up by
-        ``sandbox.container_guard`` around its own run, but a harness process
-        killed outright (Ctrl-C, OOM, a host reboot) never gets the chance to
-        run that guard's ``finally``. Sweeping once here, before this batch's
-        own containers exist, catches exactly that leak without risking a
-        live container from the run in progress.
+        Other attempts and legacy unscoped containers are never swept. Normal
+        exit/timeout cleanup still uses the exact container_guard name.
         """
         from devops_bench.agents import sandbox
 
