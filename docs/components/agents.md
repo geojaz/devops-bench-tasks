@@ -133,3 +133,16 @@ and rules are unaffected.
 
 Want to wrap a different agent? See
 [Add an agent harness](../how-to/add-an-agent-harness.md).
+
+### Concurrent sandbox cleanup
+
+Set `BENCH_AGENT_SANDBOX_OWNER` to a unique alphanumeric attempt ID before starting
+an evaluation. Container names include this owner followed by the unique workspace
+name. Startup cleanup targets only that owner's containers; never reuse an owner
+concurrently. Normal completion and timeout cleanup still target the exact container
+name through `container_guard`.
+
+Without an owner, automatic startup sweeping is disabled. Legacy containers cannot
+be identified as abandoned from their shared prefix alone: confirm their originating
+process has exited and recover them by exact container name. Never globally kill all
+`devops-bench-agent-*` containers on a host running other evaluations.

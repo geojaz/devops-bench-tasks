@@ -88,7 +88,9 @@ def test_uses_exec_credential_plugin_true_when_exec_block_present(
         sandbox,
         "run",
         lambda argv, **kwargs: SimpleNamespace(
-            returncode=0, stdout="map[apiVersion:client.authentication.k8s.io/v1beta1 ...]", stderr=""
+            returncode=0,
+            stdout="map[apiVersion:client.authentication.k8s.io/v1beta1 ...]",
+            stderr="",
         ),
     )
     assert sandbox.uses_exec_credential_plugin() is True
@@ -243,12 +245,17 @@ def test_container_guard_kills_container_on_timeout_path(monkeypatch: pytest.Mon
 def test_sweep_stray_containers_kills_only_matching_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
     calls: list[list[str]] = []
 
     def fake_run(argv, **kwargs):
         calls.append(argv)
         if argv[:2] == ["docker", "ps"]:
-            return SimpleNamespace(returncode=0, stdout="abc123\ndef456\n", stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout="devops-bench-agent-attemptA-ws\ndevops-bench-agent-attemptAB-ws\ndevops-bench-agent-legacy\n",
+                stderr="",
+            )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
@@ -256,9 +263,9 @@ def test_sweep_stray_containers_kills_only_matching_names(
 
     list_call = calls[0]
     assert list_call[0:2] == ["docker", "ps"]
-    assert any("devops-bench-agent-" in arg for arg in list_call)
+    assert "{{.Names}}" in list_call
     kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
-    assert kill_calls == [["docker", "kill", "abc123"], ["docker", "kill", "def456"]]
+    assert kill_calls == [["docker", "kill", "devops-bench-agent-attemptA-ws"]]
 
 
 def test_sweep_stray_containers_handles_docker_ps_failure_without_raising(
@@ -280,7 +287,9 @@ def _exec_plugin_dispatch(
         if argv[-1] == "jsonpath={.clusters[0].cluster.certificate-authority-data}":
             return SimpleNamespace(returncode=0, stdout="ZmFrZS1jYQ==", stderr="")
         if argv[-1] == "jsonpath={.users[0].user.exec}":
-            return SimpleNamespace(returncode=0, stdout="map[command:some-cloud-auth-plugin]", stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout="map[command:some-cloud-auth-plugin]", stderr=""
+            )
         if argv[-1] == "jsonpath={.clusters[0].cluster.server}":
             return SimpleNamespace(returncode=0, stdout="https://34.1.2.3", stderr="")
         if argv[:5] == ["kubectl", "-n", sandbox.AGENT_SA_NAMESPACE, "get", "sa"]:
@@ -357,3 +366,17 @@ def test_sweep_stray_containers_is_a_noop_when_none_are_running(
 
     kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
     assert kill_calls == []
+
+
+def test_unscoped_sweep_never_touches_other_runs(monkeypatch):
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX_OWNER", raising=False)
+    monkeypatch.setattr(sandbox, "run", lambda *a, **kw: pytest.fail("unscoped docker call"))
+    sandbox.sweep_stray_containers()
+
+
+def test_owner_is_part_of_container_name(monkeypatch, tmp_path):
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
+    assert sandbox.container_name_for_workspace(tmp_path).startswith("devops-bench-agent-attemptA-")
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "bad-owner")
+    with pytest.raises(ValueError):
+        sandbox.container_name_for_workspace(tmp_path)
